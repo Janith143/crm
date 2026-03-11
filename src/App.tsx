@@ -381,6 +381,12 @@ const AppContent: React.FC = () => {
                 View QR
               </button>
             )}
+            <button
+              onClick={() => navigate('/settings')}
+              className="ml-2 bg-transparent border border-white rounded px-2 py-0.5 text-xs hover:bg-white hover:text-amber-600 transition"
+            >
+              Check Settings
+            </button>
           </div>
         )}
         <div className="flex-1 overflow-hidden relative">

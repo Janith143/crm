@@ -930,7 +930,7 @@ app.get('/api/status', async (req, res) => {
         const settings = await getAppSettings();
         const provider = settings['WA_PROVIDER'] || 'webjs';
 
-        if (provider === 'cloud_api') {
+        if (provider === 'official' || provider === 'cloud_api') {
             const hasPhone = !!settings['WA_PHONE_ID'];
             const hasToken = !!settings['WA_CLOUD_TOKEN'];
             const connected = hasPhone && hasToken;
@@ -1261,7 +1261,7 @@ app.post('/api/send', upload.single('file'), async (req, res) => {
     let chatId = phone.includes('@') ? phone : `${sanitizedNumber}@c.us`;
 
     // --- CLOUD API LOGIC ---
-    if (provider === 'cloud_api') {
+    if (provider === 'official' || provider === 'cloud_api') {
         const accessToken = settings['WA_CLOUD_TOKEN'];
         const phoneId = settings['WA_PHONE_ID'];
 
@@ -1680,7 +1680,8 @@ app.post('/api/chats/:chatId/read', async (req, res) => {
 // 4.5. Get individual profile picture
 app.get('/api/profile-pic/:chatId', async (req, res) => {
     const settings = await getAppSettings();
-    const isCloud = settings['WA_PROVIDER'] === 'cloud_api';
+    const provider = settings['WA_PROVIDER'];
+    const isCloud = provider === 'official' || provider === 'cloud_api';
 
     if (!isCloud && !isClientReady) {
         return res.status(503).json({ success: false, error: 'WhatsApp is not connected' });
