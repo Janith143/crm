@@ -69,3 +69,9 @@ INSERT IGNORE INTO pipeline_stages (id, name, position, color) VALUES
 ('Uploaded Class', 'Uploaded Class', 5, 'bg-orange-400'),
 ('First Sale', 'First Sale', 6, 'bg-purple-500'),
 ('Active Teacher', 'Active Teacher', 7, 'bg-green-600');
+
+CREATE TABLE IF NOT EXISTS app_settings (
+    setting_key VARCHAR(100) PRIMARY KEY,
+    setting_value TEXT,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);

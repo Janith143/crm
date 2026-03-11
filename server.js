@@ -889,6 +889,41 @@ app.post('/api/metadata/:id', async (req, res) => {
     }
 });
 
+// 0.8 Settings Endpoints
+app.get('/api/settings', async (req, res) => {
+    try {
+        const [rows] = await pool.query('SELECT * FROM app_settings');
+        const settings = {};
+        rows.forEach(row => {
+            settings[row.setting_key] = row.setting_value;
+        });
+        res.json({ success: true, settings });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.post('/api/settings', async (req, res) => {
+    const { settings } = req.body;
+    if (!settings || typeof settings !== 'object') {
+        return res.status(400).json({ success: false, error: 'Invalid settings format' });
+    }
+
+    try {
+        const queries = Object.keys(settings).map(key => {
+            return pool.query(
+                'INSERT INTO app_settings (setting_key, setting_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)',
+                [key, settings[key]]
+            );
+        });
+
+        await Promise.all(queries);
+        res.json({ success: true });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
 // 1. Get Status
 app.get('/api/status', (req, res) => {
     res.json({
@@ -1179,91 +1214,125 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 // ... (middleware)
 
+// Helper to get settings
+const getAppSettings = async () => {
+    const [rows] = await pool.query('SELECT * FROM app_settings');
+    const settings = {};
+    rows.forEach(row => {
+        settings[row.setting_key] = row.setting_value;
+    });
+    return settings;
+};
+
 // 2. Send Message (Text or Media)
 app.post('/api/send', upload.single('file'), async (req, res) => {
-    console.log(`POST /api/send called. isClientReady: ${isClientReady}`);
+    const settings = await getAppSettings();
+    const provider = settings['WA_PROVIDER'] || 'webjs'; // Default to existing client
 
+    console.log(`POST /api/send called. Provider: ${provider}`);
+
+    const { phone, message } = req.body;
+    const file = req.file;
+    const tempId = Date.now().toString();
+
+    // Determine clean phone number
+    const sanitizedNumber = phone.replace(/[^0-9]/g, '');
+    let chatId = phone.includes('@') ? phone : `${sanitizedNumber}@c.us`;
+
+    // --- CLOUD API LOGIC ---
+    if (provider === 'cloud_api') {
+        const accessToken = settings['WA_CLOUD_TOKEN'];
+        const phoneId = settings['WA_PHONE_ID'];
+
+        if (!accessToken || !phoneId) {
+            return res.status(400).json({ success: false, error: 'Cloud API credentials missing in settings' });
+        }
+
+        try {
+            // Check Offline Queue (if we want to queue. Since Cloud API is HTTP, we just try to send directly)
+            let response;
+            const url = `https://graph.facebook.com/v20.0/${phoneId}/messages`;
+
+            if (file) {
+                // For media, Cloud API requires uploading first or passing URL. We will support text-only via fetch here for MVP unless we build a formData upload script.
+                // Uploading media to Meta API is a two-step process: Upload media -> get ID -> send message.
+                // For now, let's reject media or just send text caption if it fails.
+                return res.status(501).json({ success: false, error: 'Media uploads via Cloud API not yet implemented in backend.' });
+            } else {
+                // Send Text
+                const payload = {
+                    messaging_product: "whatsapp",
+                    recipient_type: "individual",
+                    to: sanitizedNumber, // Cloud API requires just the number without @c.us
+                    type: "text",
+                    text: { preview_url: false, body: message }
+                };
+
+                const graphRes = await fetch(url, {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${accessToken}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(payload)
+                });
+
+                const data = await graphRes.json();
+
+                if (!graphRes.ok) {
+                    console.error('Cloud API Error:', data);
+                    throw new Error(data.error?.message || 'Failed to send via Cloud API');
+                }
+
+                response = data;
+
+                // Save to DB immediately with the Meta Message ID so webhook can update ack
+                const metaMsgId = data.messages?.[0]?.id || tempId;
+                await pool.query(
+                    `INSERT INTO messages (id, chat_id, sender_id, from_me, body, timestamp, status, type, has_media, ack) 
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                    [metaMsgId, chatId, 'agent', 1, message, Math.floor(Date.now() / 1000), 'sent', 'text', 0, 1]
+                );
+            }
+
+            return res.json({ success: true, response });
+        } catch (error) {
+            console.error("Cloud API Send Error:", error);
+            return res.status(500).json({ success: false, error: error.message });
+        }
+    }
+
+
+    // --- WEBJS LOGIC (Existing) ---
     // OFFLINE QUEUE LOGIC
     if (!isClientReady) {
-        const { phone, message } = req.body;
         console.warn("⚠️ Client not ready. Queuing message...");
-
-        const tempId = Date.now().toString();
-        const chatId = phone.includes('@') ? phone : `${phone.replace(/[^0-9]/g, '')}@c.us`;
-
         try {
             await pool.query(
                 `INSERT INTO messages (id, chat_id, sender_id, from_me, body, timestamp, status, type, has_media, ack) 
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                [
-                    tempId,
-                    chatId,
-                    'agent', // Simplified sender
-                    1, // fromMe
-                    message || '', // Body
-                    Math.floor(Date.now() / 1000), // Unix timestamp
-                    'pending', // Status
-                    req.file ? 'media' : 'text', // Type (simplified)
-                    req.file ? 1 : 0, // hasMedia
-                    0 // ack
-                ]
+                [tempId, chatId, 'agent', 1, message || '', Math.floor(Date.now() / 1000), 'pending', file ? 'media' : 'text', file ? 1 : 0, 0]
             );
 
-            return res.json({
-                success: true,
-                status: 'queued',
-                messageId: tempId,
-                note: 'Message queued for delivery'
-            });
-
+            return res.json({ success: true, status: 'queued', messageId: tempId, note: 'Message queued for delivery' });
         } catch (dbErr) {
             console.error("Failed to queue message", dbErr);
             return res.status(500).json({ success: false, error: 'Database error while queuing' });
         }
     }
 
-    const { phone, message } = req.body;
-    const file = req.file;
-
     try {
-        let chatId;
-        if (phone.includes('@')) {
-            chatId = phone;
-        } else {
-            const sanitizedNumber = phone.replace(/[^0-9]/g, '');
-            chatId = `${sanitizedNumber}@c.us`;
-        }
-
-        console.log('Send Request Body:', req.body); // Debug log
-        console.log('Quoted Message ID:', req.body.quotedMessageId); // Debug log
-
         let response;
         if (file) {
-            console.log(`Sending media to ${chatId}:`, {
-                mimetype: file.mimetype,
-                originalname: file.originalname,
-                size: file.size
-            });
-
-            // Send Media
-            const media = new whatsappWeb.MessageMedia(
-                file.mimetype,
-                file.buffer.toString('base64'),
-                file.originalname
-            );
-
+            console.log(`Sending media to ${chatId}`);
+            const media = new whatsappWeb.MessageMedia(file.mimetype, file.buffer.toString('base64'), file.originalname);
             const options = {};
             if (file.mimetype.startsWith('audio/')) {
-                options.sendAudioAsVoice = true; // Send as PTT
-                // Force mimetype to ensure WhatsApp accepts it as PTT
+                options.sendAudioAsVoice = true;
                 media.mimetype = 'audio/mp3';
             }
-            if (message) {
-                options.caption = message;
-            }
-            if (req.body.quotedMessageId) {
-                options.quotedMessageId = req.body.quotedMessageId;
-            }
+            if (message) options.caption = message;
+            if (req.body.quotedMessageId) options.quotedMessageId = req.body.quotedMessageId;
 
             try {
                 response = await client.sendMessage(chatId, media, options);
@@ -1279,9 +1348,7 @@ app.post('/api/send', upload.single('file'), async (req, res) => {
         } else {
             // Send Text
             const options = {};
-            if (req.body.quotedMessageId) {
-                options.quotedMessageId = req.body.quotedMessageId;
-            }
+            if (req.body.quotedMessageId) options.quotedMessageId = req.body.quotedMessageId;
             response = await client.sendMessage(chatId, message, options);
         }
 
@@ -1829,6 +1896,109 @@ app.post('/api/logout', async (req, res) => {
     } catch (error) {
         console.error('Logout error:', error && error.stack ? error.stack : error);
         res.status(500).json({ success: false, error: error && error.message ? error.message : 'Unknown error' });
+    }
+});
+
+// --- CLOUD API WEBHOOKS ---
+app.get('/api/webhook', async (req, res) => {
+    const settings = await getAppSettings();
+    const VERIFY_TOKEN = settings['WA_VERIFY_TOKEN'];
+
+    const mode = req.query['hub.mode'];
+    const token = req.query['hub.verify_token'];
+    const challenge = req.query['hub.challenge'];
+
+    if (mode && token) {
+        if (mode === 'subscribe' && token === VERIFY_TOKEN) {
+            console.log('WEBHOOK_VERIFIED');
+            res.status(200).send(challenge);
+        } else {
+            res.sendStatus(403);
+        }
+    } else {
+        res.sendStatus(400);
+    }
+});
+
+app.post('/api/webhook', async (req, res) => {
+    const body = req.body;
+
+    if (body.object) {
+        if (body.entry && body.entry[0].changes && body.entry[0].changes[0] && body.entry[0].changes[0].value.messages && body.entry[0].changes[0].value.messages[0]) {
+            const val = body.entry[0].changes[0].value;
+            const message = val.messages[0];
+            const contact = val.contacts ? val.contacts[0] : null;
+
+            const msgBody = message.type === 'text' ? message.text.body : (message.type === 'interactive' && message.interactive.button_reply ? message.interactive.button_reply.title : '');
+            if (!msgBody && !['image', 'document', 'audio', 'video'].includes(message.type)) {
+                return res.sendStatus(200); // Ignore unsupported
+            }
+
+            const senderPhone = message.from;
+            const chatId = `${senderPhone}@c.us`;
+            const msgId = message.id;
+            const timestamp = message.timestamp;
+            const fromMe = false;
+            const hasMedia = ['image', 'document', 'audio', 'video'].includes(message.type);
+
+            try {
+                // Insert message
+                await pool.query(
+                    'INSERT IGNORE INTO messages (id, chat_id, sender_id, from_me, body, timestamp, status, type, has_media, ack) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                    [msgId, chatId, senderPhone, fromMe, msgBody, timestamp, 'received', message.type, hasMedia, 2]
+                );
+
+                // Upsert Chat
+                const chatName = contact && contact.profile ? contact.profile.name : senderPhone;
+                await pool.query(
+                    `INSERT INTO chats (id, name, unread_count, timestamp, last_message, last_message_type, last_message_status, last_message_from_me)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     ON DUPLICATE KEY UPDATE
+                     timestamp = VALUES(timestamp),
+                     last_message = VALUES(last_message),
+                     last_message_type = VALUES(last_message_type),
+                     last_message_status = VALUES(last_message_status),
+                     last_message_from_me = VALUES(last_message_from_me),
+                     unread_count = unread_count + 1`,
+                    [chatId, chatName, 1, timestamp, msgBody || (hasMedia ? '📷 Media' : ''), message.type, 2, fromMe]
+                );
+
+                // Emit Socket Event
+                io.emit('message_new', {
+                    id: msgId,
+                    chatId: chatId,
+                    senderId: 'teacher',
+                    text: msgBody,
+                    timestamp: new Date(timestamp * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+                    isIncoming: true,
+                    status: 'received',
+                    type: message.type,
+                    hasMedia: hasMedia,
+                    mediaType: message.type
+                });
+
+            } catch (err) {
+                console.error("Webhook processing error:", err);
+            }
+        }
+        else if (body.entry && body.entry[0].changes && body.entry[0].changes[0] && body.entry[0].changes[0].value.statuses && body.entry[0].changes[0].value.statuses[0]) {
+            // Handle Message Status updates (ack)
+            const statusObj = body.entry[0].changes[0].value.statuses[0];
+            const msgId = statusObj.id;
+            const status = statusObj.status; // 'sent', 'delivered', 'read'
+            const ack = status === 'read' ? 3 : (status === 'delivered' ? 2 : 1);
+
+            try {
+                await pool.query('UPDATE messages SET ack = ?, status = ? WHERE id = ?', [ack, status, msgId]);
+                io.emit('message_update', { id: msgId, status: status, ack: ack });
+            } catch (err) {
+                console.error("Failed to update status on webhook", err);
+            }
+        }
+
+        res.sendStatus(200);
+    } else {
+        res.sendStatus(404);
     }
 });
 

@@ -17,6 +17,30 @@ export const getStoredSettings = (): WhatsAppSettings => {
 
 export const saveSettings = (settings: WhatsAppSettings) => {
   localStorage.setItem('whatsapp_settings', JSON.stringify(settings));
+  // Sync core auth traits to backend silently
+  saveSettingsToBackend({
+    WA_PROVIDER: settings.connectionType,
+    WA_CLOUD_TOKEN: settings.accessToken || '',
+    WA_PHONE_ID: settings.phoneNumberId || '',
+    WA_BUSINESS_ACCOUNT_ID: settings.businessAccountId || '',
+    WA_VERIFY_TOKEN: settings.verifyToken || ''
+  }).catch(console.error);
+};
+
+export const saveSettingsToBackend = async (settingsPayload: any) => {
+  try {
+    const token = localStorage.getItem('token');
+    await fetch(`${API_BASE}/settings`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token && { Authorization: `Bearer ${token}` })
+      },
+      body: JSON.stringify({ settings: settingsPayload })
+    });
+  } catch (error) {
+    console.error("Failed to sync settings to backend", error);
+  }
 };
 
 // Helper to include JWT auth header when user is logged in

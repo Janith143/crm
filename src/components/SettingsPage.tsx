@@ -410,18 +410,49 @@ const SettingsPage = () => {
             </div>
 
             <div>
+              <label className="block text-sm font-medium text-slate-700 mb-1">WhatsApp Business Account ID</label>
+              <div className="relative">
+                <input
+                  type="text"
+                  name="businessAccountId"
+                  value={settings.businessAccountId || ''}
+                  onChange={handleApiChange}
+                  placeholder="e.g. 102345678901234"
+                  className="w-full pl-10 pr-4 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500 font-mono text-sm"
+                />
+                <LayoutGrid className="absolute left-3 top-2.5 text-slate-400" size={16} />
+              </div>
+            </div>
+
+            <div>
               <label className="block text-sm font-medium text-slate-700 mb-1">Permanent Access Token</label>
               <div className="relative">
                 <input
                   type="password"
                   name="accessToken"
-                  value={settings.accessToken}
+                  value={settings.accessToken || ''}
                   onChange={handleApiChange}
                   placeholder="EAAG..."
                   className="w-full pl-10 pr-4 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500 font-mono text-sm"
                 />
                 <Key className="absolute left-3 top-2.5 text-slate-400" size={16} />
               </div>
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-1">Webhook Verify Token</label>
+              <div className="relative">
+                <input
+                  type="text"
+                  name="verifyToken"
+                  value={settings.verifyToken || ''}
+                  onChange={handleApiChange}
+                  placeholder="e.g. my_secret_verify_token"
+                  className="w-full pl-10 pr-4 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500 font-mono text-sm"
+                />
+                <Shield className="absolute left-3 top-2.5 text-slate-400" size={16} />
+              </div>
+              <p className="text-xs text-slate-500 mt-1">Use this token when verifying the Webhook URL in your Meta App Dashboard.</p>
             </div>
 
             <div className="bg-amber-50 p-4 rounded-lg border border-amber-100 text-sm text-amber-800 flex items-start gap-2">
