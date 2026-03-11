@@ -925,13 +925,34 @@ app.post('/api/settings', async (req, res) => {
 });
 
 // 1. Get Status
-app.get('/api/status', (req, res) => {
-    res.json({
-        connected: isClientReady,
-        qrCode: qrCodeData,
-        info: clientInfo,
-        authenticated: isAuthenticated
-    });
+app.get('/api/status', async (req, res) => {
+    try {
+        const settings = await getAppSettings();
+        const provider = settings['WA_PROVIDER'] || 'webjs';
+
+        if (provider === 'cloud_api') {
+            const hasPhone = !!settings['WA_PHONE_ID'];
+            const hasToken = !!settings['WA_CLOUD_TOKEN'];
+            const connected = hasPhone && hasToken;
+            return res.json({
+                connected: connected,
+                authenticated: connected,
+                info: { pushname: 'Official Cloud API' },
+                provider: provider
+            });
+        }
+
+        // WebJS logic
+        res.json({
+            connected: isClientReady,
+            qrCode: qrCodeData,
+            info: clientInfo,
+            authenticated: isAuthenticated,
+            provider: provider
+        });
+    } catch (e) {
+        res.status(500).json({ error: "DB Error" });
+    }
 });
 
 // Initialize Chats Table
@@ -1658,7 +1679,10 @@ app.post('/api/chats/:chatId/read', async (req, res) => {
 
 // 4.5. Get individual profile picture
 app.get('/api/profile-pic/:chatId', async (req, res) => {
-    if (!isClientReady) {
+    const settings = await getAppSettings();
+    const isCloud = settings['WA_PROVIDER'] === 'cloud_api';
+
+    if (!isCloud && !isClientReady) {
         return res.status(503).json({ success: false, error: 'WhatsApp is not connected' });
     }
 
@@ -1666,6 +1690,12 @@ app.get('/api/profile-pic/:chatId', async (req, res) => {
 
     try {
         let profilePicUrl = null;
+
+        if (isCloud) {
+            // The Official Cloud API does not natively support fetching user profile pictures 
+            // for privacy reasons unless explicitly sent in a message context in some regions.
+            return res.json({ success: false, error: 'No profile picture' });
+        }
 
         // Strategy 1: Chat -> Contact
         try {
