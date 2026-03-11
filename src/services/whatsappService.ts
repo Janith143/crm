@@ -120,39 +120,39 @@ export const sendWhatsAppMessage = async (
     }
   }
 
-  // 2. Official API Mode (Direct from Frontend)
-  if (!settings.accessToken || !settings.phoneNumberId) {
-    return { success: false, error: 'Configuration missing' };
-  }
-
-  const GRAPH_API_VERSION = 'v17.0';
-  const BASE_URL = `https://graph.facebook.com/${GRAPH_API_VERSION}`;
-  // For official API, we still might need sanitization, but let's assume 'to' is correct for now or handle it if needed.
-  // Official API usually expects just the number.
-  const formattedPhone = to.includes('@') ? to.split('@')[0] : to.replace(/[^0-9]/g, '');
-
+  // 2. Official API Mode — Route through backend so messages are saved to DB
   try {
-    const response = await fetch(`${BASE_URL}/${settings.phoneNumberId}/messages`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${settings.accessToken}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        messaging_product: 'whatsapp',
-        to: formattedPhone,
-        type: 'text',
-        text: { body }
-      })
-    });
-    const data = await response.json();
-    if (!response.ok) {
-      return { success: false, error: data.error?.message || 'Failed to send message', data };
+    let options: RequestInit = {};
+
+    if (file) {
+      const formData = new FormData();
+      formData.append('phone', to);
+      formData.append('message', body);
+      formData.append('file', file);
+      if (quotedMessageId) {
+        formData.append('quotedMessageId', quotedMessageId);
+      }
+      options = {
+        method: 'POST',
+        body: formData
+      };
+    } else {
+      options = {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ phone: to, message: body, quotedMessageId })
+      };
     }
-    return { success: true, data };
-  } catch (error: unknown) {
-    const errorMessage = error instanceof Error ? error.message : 'Network error occurred';
-    return { success: false, error: errorMessage };
+
+    const response = await fetch(`${BACKEND_URL}/send`, options);
+    const data = await response.json();
+    if (data.success) {
+      return { success: true, data };
+    } else {
+      return { success: false, error: data.error };
+    }
+  } catch (error) {
+    return { success: false, error: 'Failed to reach WhatsApp Server. Is server.js running?' };
   }
 };
 
