@@ -1803,6 +1803,17 @@ app.post('/api/logout', async (req, res) => {
             console.error('Failed to delete session files:', fileErr);
         }
 
+        // Clear local database cache for chats and messages
+        try {
+            await pool.query('DELETE FROM messages');
+            console.log("✅ Cleared messages table on logout");
+
+            await pool.query('DELETE FROM chats');
+            console.log("✅ Cleared chats table on logout");
+        } catch (dbErr) {
+            console.error('Failed to clear database cache on logout:', dbErr);
+        }
+
         // Try to re-initialize the client so the server can accept a new login later
         try {
             if (client && typeof client.initialize === 'function') {
