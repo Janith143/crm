@@ -100,6 +100,8 @@ export interface WhatsAppSettings {
   businessAccountId?: string;
   webhookUrl?: string;
   verifyToken?: string;
+  appId?: string;
+  appSecret?: string;
   // QR / Web Session
   isLinked?: boolean;
   linkedNumber?: string;

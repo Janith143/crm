@@ -23,7 +23,9 @@ export const saveSettings = (settings: WhatsAppSettings) => {
     WA_CLOUD_TOKEN: settings.accessToken || '',
     WA_PHONE_ID: settings.phoneNumberId || '',
     WA_BUSINESS_ACCOUNT_ID: settings.businessAccountId || '',
-    WA_VERIFY_TOKEN: settings.verifyToken || ''
+    WA_VERIFY_TOKEN: settings.verifyToken || '',
+    WA_APP_ID: settings.appId || '',
+    WA_APP_SECRET: settings.appSecret || ''
   }).catch(console.error);
 };
 

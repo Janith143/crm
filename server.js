@@ -2007,6 +2007,56 @@ app.get(/^(?!\/api).*$/, (req, res) => {
     res.sendFile(path.join(__dirname, 'dist', 'index.html'));
 });
 
+// --- Meta API Token Auto-Refresh ---
+const refreshMetaToken = async () => {
+    try {
+        const settings = await getAppSettings();
+        const provider = settings['WA_PROVIDER'];
+        if (provider !== 'cloud_api') return;
+
+        const appId = settings['WA_APP_ID'];
+        const appSecret = settings['WA_APP_SECRET'];
+        const currentToken = settings['WA_CLOUD_TOKEN'];
+        const lastUpdated = settings['WA_TOKEN_UPDATED_AT'];
+
+        if (!appId || !appSecret || !currentToken) return;
+
+        // Check if 50 days have passed (50 * 24 * 60 * 60 * 1000 = 4320000000 ms)
+        // If lastUpdated is missing, default to a high value so it refreshes immediately
+        const daysSinceUpdate = lastUpdated ? (Date.now() - parseInt(lastUpdated)) / (1000 * 60 * 60 * 24) : 55;
+
+        // Refresh every 50 days to prevent the 60-day expiry
+        if (daysSinceUpdate >= 50) {
+            console.log("🔄 Auto-refreshing Meta Graph API Long-Lived Access Token...");
+            const url = `https://graph.facebook.com/v17.0/oauth/access_token?grant_type=fb_exchange_token&client_id=${appId}&client_secret=${appSecret}&fb_exchange_token=${currentToken}`;
+
+            const response = await fetch(url);
+            const data = await response.json();
+
+            if (data.access_token) {
+                // Save new token and timestamp to database
+                await pool.query(
+                    'INSERT INTO app_settings (setting_key, setting_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)',
+                    ['WA_CLOUD_TOKEN', data.access_token]
+                );
+                await pool.query(
+                    'INSERT INTO app_settings (setting_key, setting_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)',
+                    ['WA_TOKEN_UPDATED_AT', Date.now().toString()]
+                );
+                console.log("✅ Successfully refreshed Meta Access Token and updated database.");
+            } else {
+                console.error("❌ Failed to refresh Meta Access Token", data);
+            }
+        }
+    } catch (e) {
+        console.error("❌ Error in token refresh routine:", e);
+    }
+};
+
+// Check token expiration on startup + every 24 hours
+setTimeout(refreshMetaToken, 10000);
+setInterval(refreshMetaToken, 24 * 60 * 60 * 1000);
+
 // Start Client and Server
 client.initialize();
 

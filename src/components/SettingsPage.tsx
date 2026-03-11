@@ -455,6 +455,39 @@ const SettingsPage = () => {
               <p className="text-xs text-slate-500 mt-1">Use this token when verifying the Webhook URL in your Meta App Dashboard.</p>
             </div>
 
+            <hr className="border-slate-200" />
+
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-1">Meta App ID</label>
+              <div className="relative">
+                <input
+                  type="text"
+                  name="appId"
+                  value={settings.appId || ''}
+                  onChange={handleApiChange}
+                  placeholder="e.g. 1159705726296354"
+                  className="w-full pl-10 pr-4 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500 font-mono text-sm"
+                />
+                <LayoutGrid className="absolute left-3 top-2.5 text-slate-400" size={16} />
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-1">Meta App Secret</label>
+              <div className="relative">
+                <input
+                  type="password"
+                  name="appSecret"
+                  value={settings.appSecret || ''}
+                  onChange={handleApiChange}
+                  placeholder="e.g. 21047c20daa3bb992a8415ad87062ebf"
+                  className="w-full pl-10 pr-4 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500 font-mono text-sm"
+                />
+                <Key className="absolute left-3 top-2.5 text-slate-400" size={16} />
+              </div>
+              <p className="text-xs text-slate-500 mt-1">Required to automatically refresh your Token every ~50 days.</p>
+            </div>
+
             <div className="bg-amber-50 p-4 rounded-lg border border-amber-100 text-sm text-amber-800 flex items-start gap-2">
               <AlertCircle size={16} className="mt-0.5 shrink-0" />
               <div>
