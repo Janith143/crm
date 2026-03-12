@@ -47,6 +47,7 @@ const InboxPage: React.FC<InboxPageProps> = ({ teachers, onUpdateTeacher, select
     },
     enabled: !!activeTeacherId && !!activeTeacher,
     refetchInterval: false, // Disable polling
+    staleTime: 1000 * 60 * 5, // Prevent quick refetch from overwriting fresh socket data
   });
   const [activities, setActivities] = useState<Record<string, Activity[]>>({});
   const [input, setInput] = useState('');

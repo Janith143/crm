@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE TABLE IF NOT EXISTS automation_sessions (
     user_id VARCHAR(255) PRIMARY KEY, -- Phone number
     workflow_id VARCHAR(255) NOT NULL,
-    current_step_index INT DEFAULT 0,
+    current_step_index VARCHAR(255) DEFAULT '0',
     last_interaction TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 

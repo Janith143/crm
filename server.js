@@ -349,7 +349,30 @@ client.on('message_create', async (msg) => {
     // Ignore messages from self (handled separately or if we want to store them too)
     // Actually message_create fires for own messages too.
 
-    const body = msg.body.toLowerCase();
+    let actualBody = msg.body;
+    let actualType = msg.type;
+
+    // Check for Facebook Boosted Post / Ad context
+    const dynamicContext = msg.dynamicReplyContext || (msg._data && msg._data.dynamicReplyContext);
+    if (dynamicContext) {
+        const title = dynamicContext.title || "Ads";
+        const adMessage = `[FB Ad Reply: ${title}]`;
+        if (!actualBody) actualBody = adMessage;
+        else actualBody = `${adMessage}\n\n${actualBody}`;
+        actualType = 'ad_reply';
+    }
+
+    // Fallback for quotedAd if dynamicReplyContext is missing
+    const quotedAd = msg.quotedAd || (msg._data && msg._data.quotedAd);
+    if (quotedAd && !dynamicContext) {
+        const title = quotedAd.title || "Ads";
+        const adMessage = `[FB Ad Reply: ${title}]`;
+        if (!actualBody) actualBody = adMessage;
+        else actualBody = `${adMessage}\n\n${actualBody}`;
+        actualType = 'ad_reply';
+    }
+
+    const body = actualBody.toLowerCase();
     const userId = msg.from; // Phone number (e.g. 9477...@c.us)
     const chatId = msg.id.remote;
 
@@ -361,10 +384,10 @@ client.on('message_create', async (msg) => {
                 chatId,
                 msg.author || msg.from,
                 msg.fromMe,
-                msg.body,
+                actualBody,
                 msg.timestamp,
                 msg.ack === 3 ? 'read' : msg.ack === 2 ? 'received' : 'sent',
-                msg.type,
+                actualType,
                 msg.hasMedia,
                 msg.ack
             ]
@@ -397,8 +420,8 @@ client.on('message_create', async (msg) => {
                     chatName,
                     msg.fromMe ? 0 : 1, // Unread if incoming
                     msg.timestamp,
-                    msg.body || (msg.hasMedia ? '📷 Media' : ''),
-                    msg.type,
+                    actualBody || (msg.hasMedia ? '📷 Media' : ''),
+                    actualType,
                     msg.ack || 0,
                     msg.fromMe
                 ]
@@ -413,13 +436,13 @@ client.on('message_create', async (msg) => {
             id: msg.id.id,
             chatId: chatId,
             senderId: msg.fromMe ? 'agent' : 'teacher', // simplified
-            text: msg.body,
+            text: actualBody,
             timestamp: new Date(msg.timestamp * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
             isIncoming: !msg.fromMe,
             status: msg.ack === 3 ? 'read' : msg.ack === 2 ? 'received' : 'sent',
-            type: msg.type,
+            type: actualType,
             hasMedia: msg.hasMedia,
-            mediaType: msg.type
+            mediaType: actualType
         });
 
     } catch (dbErr) {
