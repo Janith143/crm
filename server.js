@@ -706,6 +706,28 @@ app.post('/api/automations', async (req, res) => {
     }
 });
 
+// 0.4.1 Debug: Test automation matching with a text body
+app.post('/api/debug/automation', async (req, res) => {
+    const { text } = req.body;
+    if (!text) return res.status(400).json({ error: 'text field required' });
+    const lc = text.toLowerCase();
+    try {
+        const [rules] = await pool.query('SELECT * FROM automation_rules WHERE active = 1');
+        const matches = rules.filter(r => {
+            if (r.match_type === 'exact') return lc === r.trigger_text.toLowerCase();
+            return lc.includes(r.trigger_text.toLowerCase());
+        });
+        res.json({ success: true, tested: text, activeRules: rules.length, matches: matches.map(r => ({ id: r.id, name: r.name, trigger: r.trigger_text })) });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// 0.4.2 Debug: Server status
+app.get('/api/debug/status', (req, res) => {
+    res.json({ isClientReady, isAuthenticated, clientInfo });
+});
+
 app.put('/api/automations/:id', async (req, res) => {
     const { id } = req.params;
     const { name, trigger, response, active, matchType } = req.body;

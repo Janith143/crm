@@ -390,7 +390,8 @@ const InboxPage: React.FC<InboxPageProps> = ({ teachers, onUpdateTeacher, select
           status: msg.status,
           type: msg.type,
           hasMedia: msg.hasMedia,
-          mediaType: msg.mediaType
+          mediaType: msg.mediaType,
+          quotedMessage: msg.quotedMessage
         }];
       });
 
