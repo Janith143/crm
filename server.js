@@ -372,13 +372,30 @@ client.on('message_create', async (msg) => {
         actualType = 'ad_reply';
     }
 
-    const body = actualBody.toLowerCase();
+    const body = (actualBody || '').toLowerCase();
     const userId = msg.from; // Phone number (e.g. 9477...@c.us)
     const chatId = msg.id.remote;
 
+    // Extract quoted message context (if any)
+    let quotedMsgId = null;
+    let quotedMsgBody = null;
+    let quotedMsgSender = null;
+    try {
+        if (msg.hasQuotedMsg) {
+            const quotedMsg = await msg.getQuotedMessage();
+            if (quotedMsg) {
+                quotedMsgId = quotedMsg.id?.id || null;
+                quotedMsgBody = quotedMsg.body || null;
+                quotedMsgSender = quotedMsg.fromMe ? 'agent' : (quotedMsg.author || quotedMsg.from || 'teacher');
+            }
+        }
+    } catch (qErr) {
+        console.warn('Could not extract quoted message:', qErr.message);
+    }
+
     try {
         await pool.query(
-            'INSERT IGNORE INTO messages (id, chat_id, sender_id, from_me, body, timestamp, status, type, has_media, ack) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            'INSERT IGNORE INTO messages (id, chat_id, sender_id, from_me, body, timestamp, status, type, has_media, ack, quoted_msg_id, quoted_msg_body, quoted_msg_sender) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             [
                 msg.id.id,
                 chatId,
@@ -389,7 +406,10 @@ client.on('message_create', async (msg) => {
                 msg.ack === 3 ? 'read' : msg.ack === 2 ? 'received' : 'sent',
                 actualType,
                 msg.hasMedia,
-                msg.ack
+                msg.ack,
+                quotedMsgId,
+                quotedMsgBody,
+                quotedMsgSender
             ]
         );
         // console.log(`💾 Saved message ${msg.id.id} to DB`);
@@ -442,7 +462,12 @@ client.on('message_create', async (msg) => {
             status: msg.ack === 3 ? 'read' : msg.ack === 2 ? 'received' : 'sent',
             type: actualType,
             hasMedia: msg.hasMedia,
-            mediaType: actualType
+            mediaType: actualType,
+            quotedMessage: quotedMsgId ? {
+                id: quotedMsgId,
+                body: quotedMsgBody,
+                senderId: quotedMsgSender
+            } : undefined
         });
 
     } catch (dbErr) {
@@ -450,6 +475,11 @@ client.on('message_create', async (msg) => {
     }
 
     if (msg.fromMe) return; // Stop automation for own messages
+
+    // Only process text-based messages for automation
+    if (!body.trim()) return;
+
+    console.log(`[AUTOMATION] Incoming from ${userId}: "${body}"`);
 
     // 1. Check for "Live Chat" stop condition
     if (body.includes('live chat') || body.includes('livechat')) {
@@ -1376,7 +1406,15 @@ app.post('/api/send', upload.single('file'), async (req, res) => {
                 media.mimetype = 'audio/mp3';
             }
             if (message) options.caption = message;
-            if (req.body.quotedMessageId) options.quotedMessageId = req.body.quotedMessageId;
+            if (req.body.quotedMessageId) {
+                // WA-web.js requires the actual Message object
+                try {
+                    const quotedMsg = await client.getMessageById(req.body.quotedMessageId);
+                    if (quotedMsg) options.quotedMessageId = quotedMsg;
+                } catch (qErr) {
+                    console.warn('Could not resolve quoted media message:', qErr.message);
+                }
+            }
 
             try {
                 response = await client.sendMessage(chatId, media, options);
@@ -1392,7 +1430,15 @@ app.post('/api/send', upload.single('file'), async (req, res) => {
         } else {
             // Send Text
             const options = {};
-            if (req.body.quotedMessageId) options.quotedMessageId = req.body.quotedMessageId;
+            if (req.body.quotedMessageId) {
+                // WA-web.js requires the actual Message object, not a bare ID string
+                try {
+                    const quotedMsg = await client.getMessageById(req.body.quotedMessageId);
+                    if (quotedMsg) options.quotedMessageId = quotedMsg;
+                } catch (qErr) {
+                    console.warn('Could not resolve quoted message:', qErr.message);
+                }
+            }
             response = await client.sendMessage(chatId, message, options);
         }
 
