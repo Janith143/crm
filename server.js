@@ -2069,9 +2069,47 @@ app.post('/api/webhook', async (req, res) => {
             const message = val.messages[0];
             const contact = val.contacts ? val.contacts[0] : null;
 
-            const msgBody = message.type === 'text' ? message.text.body : (message.type === 'interactive' && message.interactive.button_reply ? message.interactive.button_reply.title : '');
-            if (!msgBody && !['image', 'document', 'audio', 'video'].includes(message.type)) {
-                return res.sendStatus(200); // Ignore unsupported
+            // --- Body extraction ---
+            let msgBody = '';
+            if (message.type === 'text') {
+                msgBody = message.text.body;
+            } else if (message.type === 'interactive' && message.interactive?.button_reply) {
+                msgBody = message.interactive.button_reply.title;
+            } else if (message.type === 'interactive' && message.interactive?.list_reply) {
+                msgBody = message.interactive.list_reply.title;
+            }
+
+            // --- Facebook Ad / Referral context ---
+            let actualBody = msgBody;
+            let actualType = message.type;
+            const referral = message.referral;
+            if (referral) {
+                const adTitle = referral.headline || referral.source_id || 'Boosted Post';
+                const adTag = `[FB Ad Reply: ${adTitle}]`;
+                actualBody = actualBody ? `${adTag}\n\n${actualBody}` : adTag;
+                actualType = 'ad_reply';
+            }
+
+            // --- Quoted message context (from WhatsApp context field) ---
+            let quotedMsgId = null;
+            let quotedMsgBody = null;
+            let quotedMsgSender = null;
+            if (message.context) {
+                quotedMsgId = message.context.id || null;
+                // Look up the quoted message body from DB
+                if (quotedMsgId) {
+                    try {
+                        const [qRows] = await pool.query('SELECT body, from_me FROM messages WHERE id = ?', [quotedMsgId]);
+                        if (qRows.length > 0) {
+                            quotedMsgBody = qRows[0].body;
+                            quotedMsgSender = qRows[0].from_me ? 'agent' : 'teacher';
+                        }
+                    } catch (e) { /* ignore */ }
+                }
+            }
+
+            if (!actualBody && !['image', 'document', 'audio', 'video', 'sticker'].includes(message.type)) {
+                return res.sendStatus(200); // Ignore unsupported with no body
             }
 
             const senderPhone = message.from;
@@ -2079,13 +2117,13 @@ app.post('/api/webhook', async (req, res) => {
             const msgId = message.id;
             const timestamp = message.timestamp;
             const fromMe = false;
-            const hasMedia = ['image', 'document', 'audio', 'video'].includes(message.type);
+            const hasMedia = ['image', 'document', 'audio', 'video', 'sticker'].includes(message.type);
 
             try {
-                // Insert message
+                // Insert message with quoted context
                 await pool.query(
-                    'INSERT IGNORE INTO messages (id, chat_id, sender_id, from_me, body, timestamp, status, type, has_media, ack) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-                    [msgId, chatId, senderPhone, fromMe, msgBody, timestamp, 'received', message.type, hasMedia, 2]
+                    'INSERT IGNORE INTO messages (id, chat_id, sender_id, from_me, body, timestamp, status, type, has_media, ack, quoted_msg_id, quoted_msg_body, quoted_msg_sender) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                    [msgId, chatId, senderPhone, fromMe, actualBody, timestamp, 'received', actualType, hasMedia, 2, quotedMsgId, quotedMsgBody, quotedMsgSender]
                 );
 
                 // Upsert Chat
@@ -2100,28 +2138,156 @@ app.post('/api/webhook', async (req, res) => {
                      last_message_status = VALUES(last_message_status),
                      last_message_from_me = VALUES(last_message_from_me),
                      unread_count = unread_count + 1`,
-                    [chatId, chatName, 1, timestamp, msgBody || (hasMedia ? '📷 Media' : ''), message.type, 2, fromMe]
+                    [chatId, chatName, 1, timestamp, actualBody || (hasMedia ? '📷 Media' : ''), actualType, 2, fromMe]
                 );
 
-                // Emit Socket Event
+                // Emit Socket Event (now includes quotedMessage)
                 io.emit('message_new', {
                     id: msgId,
                     chatId: chatId,
                     senderId: 'teacher',
-                    text: msgBody,
+                    text: actualBody,
                     timestamp: new Date(timestamp * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
                     isIncoming: true,
                     status: 'received',
-                    type: message.type,
+                    type: actualType,
                     hasMedia: hasMedia,
-                    mediaType: message.type
+                    mediaType: actualType,
+                    quotedMessage: quotedMsgId ? { id: quotedMsgId, body: quotedMsgBody, senderId: quotedMsgSender } : undefined
                 });
 
             } catch (err) {
-                console.error("Webhook processing error:", err);
+                console.error("Webhook DB/socket error:", err);
             }
-        }
-        else if (body.entry && body.entry[0].changes && body.entry[0].changes[0] && body.entry[0].changes[0].value.statuses && body.entry[0].changes[0].value.statuses[0]) {
+
+            // --- AUTOMATION LOGIC (Official API) ---
+            if (actualBody && actualBody.trim()) {
+                const bodyLc = actualBody.toLowerCase();
+                const userId = chatId;
+                console.log(`[WEBHOOK AUTOMATION] From ${senderPhone}: "${bodyLc}"`);
+
+                // Helper: send via Cloud API
+                const sendCloudReply = async (toPhone, replyText) => {
+                    const settings = await getAppSettings();
+                    const accessToken = settings['WA_CLOUD_TOKEN'];
+                    const phoneId = settings['WA_PHONE_ID'];
+                    if (!accessToken || !phoneId) return;
+                    const url = `https://graph.facebook.com/v20.0/${phoneId}/messages`;
+                    const payload = {
+                        messaging_product: "whatsapp",
+                        recipient_type: "individual",
+                        to: toPhone,
+                        type: "text",
+                        text: { preview_url: false, body: replyText }
+                    };
+                    try {
+                        const r = await fetch(url, {
+                            method: 'POST',
+                            headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+                            body: JSON.stringify(payload)
+                        });
+                        const data = await r.json();
+                        const replyMsgId = data.messages?.[0]?.id || Date.now().toString();
+                        // Save auto-reply to DB
+                        await pool.query(
+                            'INSERT IGNORE INTO messages (id, chat_id, sender_id, from_me, body, timestamp, status, type, has_media, ack) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                            [replyMsgId, userId, 'agent', 1, replyText, Math.floor(Date.now() / 1000), 'sent', 'text', 0, 1]
+                        );
+                        io.emit('message_new', {
+                            id: replyMsgId, chatId: userId, senderId: 'agent',
+                            text: replyText,
+                            timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+                            isIncoming: false, status: 'sent', type: 'text', hasMedia: false
+                        });
+                    } catch (e) {
+                        console.error('Cloud API auto-reply failed:', e.message);
+                    }
+                };
+
+                // 1. Live Chat stop condition
+                if (bodyLc.includes('live chat') || bodyLc.includes('livechat')) {
+                    try {
+                        await pool.query('DELETE FROM automation_sessions WHERE user_id = ?', [userId]);
+                        await sendCloudReply(senderPhone, "Connecting you to a human agent. Automation stopped.");
+                    } catch (e) { console.error(e); }
+                } else {
+                    try {
+                        // 2. Check active session
+                        const [sessionRows] = await pool.query('SELECT * FROM automation_sessions WHERE user_id = ?', [userId]);
+                        const session = sessionRows[0] || null;
+
+                        if (session) {
+                            const [ruleRows] = await pool.query('SELECT * FROM automation_rules WHERE id = ?', [session.workflow_id]);
+                            const rule = ruleRows[0];
+                            if (rule) {
+                                const steps = typeof rule.steps === 'string' ? JSON.parse(rule.steps) : rule.steps;
+                                const currentStepId = session.current_step_index.toString();
+                                const currentStep = steps.find(s => s.id === currentStepId);
+
+                                if (!currentStep) {
+                                    await pool.query('DELETE FROM automation_sessions WHERE user_id = ?', [userId]);
+                                } else if (currentStep.options && currentStep.options.length > 0) {
+                                    const matched = currentStep.options.find(o => bodyLc.includes(o.keyword.toLowerCase()));
+                                    if (matched) {
+                                        const nextStep = steps.find(s => s.id === matched.nextStepId);
+                                        if (nextStep) {
+                                            await sendCloudReply(senderPhone, nextStep.content);
+                                            await pool.query('UPDATE automation_sessions SET current_step_index = ?, last_interaction = NOW() WHERE user_id = ?', [nextStep.id, userId]);
+                                        }
+                                    }
+                                } else {
+                                    // Linear progression
+                                    const currentIdx = steps.findIndex(s => s.id === currentStepId);
+                                    if (currentIdx !== -1 && currentIdx < steps.length - 1) {
+                                        const nextStep = steps[currentIdx + 1];
+                                        await sendCloudReply(senderPhone, nextStep.content);
+                                        await pool.query('UPDATE automation_sessions SET current_step_index = ?, last_interaction = NOW() WHERE user_id = ?', [nextStep.id, userId]);
+                                    } else {
+                                        await pool.query('DELETE FROM automation_sessions WHERE user_id = ?', [userId]);
+                                    }
+                                }
+                            } else {
+                                await pool.query('DELETE FROM automation_sessions WHERE user_id = ?', [userId]);
+                            }
+                        } else {
+                            // 3. Check new triggers
+                            const [rules] = await pool.query('SELECT * FROM automation_rules WHERE active = 1');
+                            for (const rule of rules) {
+                                let match = rule.match_type === 'exact'
+                                    ? bodyLc === rule.trigger_text.toLowerCase()
+                                    : bodyLc.includes(rule.trigger_text.toLowerCase());
+
+                                if (match) {
+                                    console.log(`[WEBHOOK AUTOMATION] Matched rule: ${rule.name}`);
+                                    const steps = typeof rule.steps === 'string' ? JSON.parse(rule.steps) : rule.steps;
+                                    let firstContent = rule.response_text;
+                                    let firstId = '0';
+                                    if (steps && steps.length > 0 && typeof steps[0] === 'object') {
+                                        firstContent = steps[0].content;
+                                        firstId = steps[0].id;
+                                    }
+                                    await sendCloudReply(senderPhone, firstContent);
+                                    pool.query('UPDATE automation_rules SET hit_count = hit_count + 1 WHERE id = ?', [rule.id]).catch(() => { });
+                                    // Start session if multi-step
+                                    if (steps && steps.length > 0) {
+                                        const hasOptions = typeof steps[0] === 'object' && steps[0].options && steps[0].options.length > 0;
+                                        if (steps.length > 1 || hasOptions) {
+                                            await pool.query(
+                                                'INSERT INTO automation_sessions (user_id, workflow_id, current_step_index) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE workflow_id = ?, current_step_index = ?',
+                                                [userId, rule.id, firstId, rule.id, firstId]
+                                            );
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    } catch (autoErr) {
+                        console.error('[WEBHOOK AUTOMATION] Error:', autoErr);
+                    }
+                }
+            }
+        } else if (body.entry && body.entry[0].changes && body.entry[0].changes[0] && body.entry[0].changes[0].value.statuses && body.entry[0].changes[0].value.statuses[0]) {
             // Handle Message Status updates (ack)
             const statusObj = body.entry[0].changes[0].value.statuses[0];
             const msgId = statusObj.id;
