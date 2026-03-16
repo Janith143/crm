@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Save, AlertCircle, CheckCircle, Smartphone, QrCode, RefreshCw, LogOut, LayoutGrid, Key, Shield } from 'lucide-react';
 import { type WhatsAppSettings } from '../types';
-import { getStoredSettings, saveSettings, getBackendStatus, logoutBackend } from '../services/whatsappService';
+import { getStoredSettings, saveSettings, getBackendStatus, logoutBackend, saveSettingsToBackend } from '../services/whatsappService';
 import { socket } from '../services/socket';
 
 const SettingsPage = () => {
@@ -151,7 +151,9 @@ const SettingsPage = () => {
     setActiveTab(tab);
     const newSettings = { ...settings, connectionType: tab };
     setSettings(newSettings);
-    saveSettings(newSettings);
+    // Don't save to backend immediately just by clicking the tab.
+    // If they click 'Official API' to check it out, we don't want to break their QR code generation.
+    localStorage.setItem('whatsapp_settings', JSON.stringify(newSettings));
   };
 
   // --- Official API Handlers ---
@@ -165,8 +167,13 @@ const SettingsPage = () => {
   };
 
   // --- QR Code Handlers ---
-  const generateQRCode = () => {
+  const generateQRCode = async () => {
     setQrStatus('loading');
+
+    // Ensure backend knows we are trying to use QR code
+    const newSettings = { ...settings, connectionType: 'qr' as const };
+    setSettings(newSettings);
+    await saveSettingsToBackend({ WA_PROVIDER: 'qr' });
 
     // Start Polling the backend every 2 seconds
     if (pollInterval.current) clearInterval(pollInterval.current);
