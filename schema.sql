@@ -21,6 +21,9 @@ CREATE TABLE IF NOT EXISTS messages (
     type VARCHAR(50),
     has_media BOOLEAN DEFAULT FALSE,
     ack INT DEFAULT 0,
+    quoted_msg_id VARCHAR(255) DEFAULT NULL,
+    quoted_msg_body TEXT DEFAULT NULL,
+    quoted_msg_sender VARCHAR(255) DEFAULT NULL,
     INDEX idx_chat_id (chat_id),
     INDEX idx_timestamp (timestamp)
 );
