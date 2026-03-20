@@ -341,11 +341,11 @@ client.on('message_ack', async (msg, ack) => {
 
 
 // --- Automation Logic ---
-// --- Automation Logic ---
 // Rules will be fetched from DB
 
-
-client.on('message_create', async (msg) => {
+// Shared handler for both incoming (message) and outgoing (message_create) messages
+async function handleIncomingOrCreatedMessage(msg, eventSource = 'message_create') {
+    console.log(`📩 [${eventSource}] Message received: id=${msg.id.id}, from=${msg.from}, fromMe=${msg.fromMe}, type=${msg.type}`);
     // Ignore messages from self (handled separately or if we want to store them too)
     // Actually message_create fires for own messages too.
 
@@ -395,7 +395,8 @@ client.on('message_create', async (msg) => {
 
     try {
         await pool.query(
-            'INSERT IGNORE INTO messages (id, chat_id, sender_id, from_me, body, timestamp, status, type, has_media, ack, quoted_msg_id, quoted_msg_body, quoted_msg_sender) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            `INSERT INTO messages (id, chat_id, sender_id, from_me, body, timestamp, status, type, has_media, ack, quoted_msg_id, quoted_msg_body, quoted_msg_sender) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE body = VALUES(body), status = VALUES(status), ack = VALUES(ack), type = VALUES(type), has_media = VALUES(has_media)`,
             [
                 msg.id.id,
                 chatId,
@@ -471,7 +472,7 @@ client.on('message_create', async (msg) => {
         });
 
     } catch (dbErr) {
-        console.error("Failed to save message to DB", dbErr);
+        console.error(`❌ Failed to save message ${msg.id.id} to DB:`, dbErr.message);
     }
 
     if (msg.fromMe) return; // Stop automation for own messages
@@ -658,6 +659,18 @@ client.on('message_create', async (msg) => {
     } catch (error) {
         console.error('Error in automation logic:', error);
     }
+}
+
+// Primary listener for INCOMING messages — most reliable for inbound
+client.on('message', async (msg) => {
+    await handleIncomingOrCreatedMessage(msg, 'message');
+});
+
+// Listener for OUTGOING messages (fromMe) — message_create fires for both but
+// we only use it for outgoing to avoid duplicate processing of incoming messages
+client.on('message_create', async (msg) => {
+    if (!msg.fromMe) return; // Incoming already handled by 'message' event above
+    await handleIncomingOrCreatedMessage(msg, 'message_create');
 });
 
 // --- API Endpoints for Frontend ---
@@ -1612,7 +1625,7 @@ app.get('/api/messages/:phone', async (req, res) => {
 
             try {
                 const chat = await client.getChatById(chatId);
-                recentMessages = await chat.fetchMessages({ limit: 50 });
+                recentMessages = await chat.fetchMessages({ limit: 200 });
                 console.log(`Fetched ${recentMessages.length} recent messages from WhatsApp (lib)`);
             } catch (libErr) {
                 console.warn(`⚠️ client.getChatById failed: ${libErr.message}. Trying Puppeteer fallback...`);
