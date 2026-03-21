@@ -162,6 +162,7 @@ export const sendBroadcastMessage = async (
   batchSize: number = 10,
   delayMinutes: number = 10,
   delaySeconds: number = 0,
+  file?: File | null,
   onProgress?: (sent: number, total: number, status: string, nextBatchTime: Date | null) => void
 ): Promise<{ successful: string[]; failed: string[] }> => {
   const successful: string[] = [];
@@ -177,7 +178,7 @@ export const sendBroadcastMessage = async (
         onProgress(successful.length + failed.length, total, 'Sending messages...', null);
       }
 
-      const result = await sendWhatsAppMessage(phone, message);
+      const result = await sendWhatsAppMessage(phone, message, file || undefined);
       if (result.success) {
         successful.push(phone);
       } else {
