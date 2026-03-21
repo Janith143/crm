@@ -158,20 +158,60 @@ export const sendWhatsAppMessage = async (
 
 export const sendBroadcastMessage = async (
   recipients: string[],
-  message: string
+  message: string,
+  batchSize: number = 10,
+  delayMinutes: number = 10,
+  delaySeconds: number = 0,
+  onProgress?: (sent: number, total: number, status: string, nextBatchTime: Date | null) => void
 ): Promise<{ successful: string[]; failed: string[] }> => {
   const successful: string[] = [];
   const failed: string[] = [];
+  const total = recipients.length;
 
-  for (const phone of recipients) {
-    const result = await sendWhatsAppMessage(phone, message);
-    if (result.success) {
-      successful.push(phone);
-    } else {
-      failed.push(phone);
+  for (let i = 0; i < total; i += batchSize) {
+    const chunk = recipients.slice(i, i + batchSize);
+
+    // Process current batch
+    for (const phone of chunk) {
+      if (onProgress) {
+        onProgress(successful.length + failed.length, total, 'Sending messages...', null);
+      }
+
+      const result = await sendWhatsAppMessage(phone, message);
+      if (result.success) {
+        successful.push(phone);
+      } else {
+        failed.push(phone);
+      }
+
+      // Small delay between individual messages to prevent flooding the backend
+      await new Promise(resolve => setTimeout(resolve, 500));
     }
-    // Small delay to prevent rate limits
-    await new Promise(resolve => setTimeout(resolve, 500));
+
+    // If there are more batches left, apply the delay
+    if (i + batchSize < total) {
+      const delayMs = (delayMinutes * 60 + delaySeconds) * 1000;
+      const nextBatchTime = new Date(Date.now() + delayMs);
+
+      if (onProgress) {
+        const delayStr = delayMinutes > 0
+          ? `${delayMinutes}m ${delaySeconds}s`
+          : `${delaySeconds}s`;
+
+        onProgress(
+          successful.length + failed.length,
+          total,
+          `Waiting ${delayStr} before next batch to prevent ban risk...`,
+          nextBatchTime
+        );
+      }
+
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+    }
+  }
+
+  if (onProgress) {
+    onProgress(total, total, 'Completed', null);
   }
 
   return { successful, failed };

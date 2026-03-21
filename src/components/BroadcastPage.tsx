@@ -19,6 +19,12 @@ const BroadcastPage: React.FC<BroadcastPageProps> = ({ teachers }) => {
   const [isSending, setIsSending] = useState(false);
   const [sendResult, setSendResult] = useState<{ success: number, failed: number } | null>(null);
 
+  // Rate Limiting States
+  const [batchSize, setBatchSize] = useState<number>(10);
+  const [delayMinutes, setDelayMinutes] = useState<number>(10);
+  const [delaySeconds, setDelaySeconds] = useState<number>(0);
+  const [progress, setProgress] = useState<{ sent: number; total: number; status: string; nextBatchTime: Date | null } | null>(null);
+
   // Determine audience based on selected segment (pipeline stage or tag)
   const getAudience = (segment: string) => {
     if (segment === 'All') return teachers;
@@ -58,14 +64,25 @@ const BroadcastPage: React.FC<BroadcastPageProps> = ({ teachers }) => {
 
   const handleSendBroadcast = async () => {
     setIsSending(true);
+    setProgress({ sent: 0, total: audience.length, status: 'Initializing...', nextBatchTime: null });
 
     // Extract phone numbers
     const recipients = audience.map(t => t.phone);
 
     // Send via service (handles real API if configured, otherwise simulates)
-    const result = await sendBroadcastMessage(recipients, messageText);
+    const result = await sendBroadcastMessage(
+      recipients,
+      messageText,
+      batchSize,
+      delayMinutes,
+      delaySeconds,
+      (sent, total, status, nextBatchTime) => {
+        setProgress({ sent, total, status, nextBatchTime });
+      }
+    );
 
     setIsSending(false);
+    setProgress(null);
     setSendResult({
       success: result.successful.length,
       failed: result.failed.length
@@ -84,7 +101,7 @@ const BroadcastPage: React.FC<BroadcastPageProps> = ({ teachers }) => {
           <span className="text-green-600 font-bold">{sendResult.success} sent</span> • <span className="text-red-500 font-bold">{sendResult.failed} failed</span>
         </p>
         <button
-          onClick={() => { setSendResult(null); setStep(1); setMessageText(''); }}
+          onClick={() => { setSendResult(null); setStep(1); setMessageText(''); setProgress(null); }}
           className="bg-slate-900 text-white px-6 py-2 rounded-lg hover:bg-slate-800 transition-colors"
         >
           Send Another Campaign
@@ -212,6 +229,92 @@ const BroadcastPage: React.FC<BroadcastPageProps> = ({ teachers }) => {
                 <p className="mt-4 text-sm text-slate-500">Preview on mobile device</p>
               </div>
             </div>
+
+            {/* Rate Limiting Options */}
+            <div className="mt-6 pt-6 border-t border-slate-200">
+              <h4 className="text-sm font-semibold text-slate-800 mb-4 flex items-center gap-2">
+                <AlertCircle size={16} className="text-amber-500" />
+                Anti-Ban Rate Limiting
+              </h4>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <div>
+                  <label className="block text-sm font-medium text-slate-700 mb-2">Contacts per batch</label>
+                  <input
+                    type="number"
+                    min="1"
+                    value={batchSize}
+                    onChange={(e) => setBatchSize(parseInt(e.target.value) || 1)}
+                    disabled={isSending}
+                    className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:border-green-500 disabled:bg-slate-50 disabled:text-slate-500"
+                  />
+                  <p className="text-xs text-slate-500 mt-1">Number of messages to send at once.</p>
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-slate-700 mb-2">Delay between batches</label>
+                  <div className="flex gap-4">
+                    <div className="flex-1">
+                      <div className="relative">
+                        <input
+                          type="number"
+                          min="0"
+                          value={delayMinutes}
+                          onChange={(e) => setDelayMinutes(parseInt(e.target.value) || 0)}
+                          disabled={isSending}
+                          className="w-full pl-3 pr-10 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:border-green-500 disabled:bg-slate-50 disabled:text-slate-500"
+                        />
+                        <div className="absolute right-3 top-2 text-xs text-slate-400">min</div>
+                      </div>
+                    </div>
+                    <div className="flex-1">
+                      <div className="relative">
+                        <input
+                          type="number"
+                          min="0"
+                          max="59"
+                          value={delaySeconds}
+                          onChange={(e) => setDelaySeconds(parseInt(e.target.value) || 0)}
+                          disabled={isSending}
+                          className="w-full pl-3 pr-10 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:border-green-500 disabled:bg-slate-50 disabled:text-slate-500"
+                        />
+                        <div className="absolute right-3 top-2 text-xs text-slate-400">sec</div>
+                      </div>
+                    </div>
+                  </div>
+                  <p className="text-xs text-slate-500 mt-1">Wait time before sending the next batch.</p>
+                </div>
+              </div>
+            </div>
+
+            {/* Progress Display */}
+            {isSending && progress && (
+              <div className="mt-6 p-4 border border-blue-200 bg-blue-50 rounded-lg animate-in fade-in slide-in-from-top-2">
+                <div className="flex justify-between items-center mb-2">
+                  <span className="text-sm font-medium text-blue-800">Sending Broadcast...</span>
+                  <span className="text-sm font-bold text-blue-800">
+                    {progress.sent} / {progress.total}
+                  </span>
+                </div>
+                <div className="w-full bg-blue-200 rounded-full h-2.5 mb-2 overflow-hidden">
+                  <div
+                    className="bg-blue-600 h-2.5 rounded-full transition-all duration-500"
+                    style={{ width: `${Math.max(2, (progress.sent / progress.total) * 100)}%` }}
+                  ></div>
+                </div>
+                <div className="flex justify-between items-start text-xs text-blue-600">
+                  <div className="animate-pulse flex-1 pr-4">{progress.status}</div>
+                  {progress.nextBatchTime && (
+                    <div className="font-medium text-right shrink-0">
+                      Next batch at:<br />
+                      {progress.nextBatchTime.toLocaleTimeString()}
+                    </div>
+                  )}
+                </div>
+                <div className="mt-3 pt-3 border-t border-blue-200/50 text-xs font-semibold text-red-600 flex items-center gap-1.5">
+                  <AlertCircle size={14} className="animate-pulse" />
+                  DO NOT close this browser tab until the broadcast is completely finished!
+                </div>
+              </div>
+            )}
 
             <div className="mt-8 flex justify-between items-center">
               <button

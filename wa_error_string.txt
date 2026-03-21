@@ -1,0 +1,5 @@
+Error: The browser is already running for E:\Business\Websites\Clazz_CRM\clazz.lk-teacher-crm\.wwebjs_auth\session. Use a different `userDataDir` or stop the running browser first.
+Error: The browser is already running for E:\Business\Websites\Clazz_CRM\clazz.lk-teacher-crm\.wwebjs_auth\session. Use a different `userDataDir` or stop the running browser first.
+    at ChromeLauncher.launch (E:\Business\Websites\Clazz_CRM\clazz.lk-teacher-crm\node_modules\puppeteer-core\lib\cjs\puppeteer\node\BrowserLauncher.js:175:23)
+    at process.processTicksAndRejections (node:internal/process/task_queues:105:5)
+    at async Client.initialize (E:\Business\Websites\Clazz_CRM\clazz.lk-teacher-crm\node_modules\whatsapp-web.js\src\Client.js:331:23)
