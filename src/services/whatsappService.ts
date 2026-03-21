@@ -158,16 +158,18 @@ export const sendWhatsAppMessage = async (
 
 export const sendBroadcastMessage = async (
   recipients: string[],
-  message: string,
+  messages: string[],
   batchSize: number = 10,
   delayMinutes: number = 10,
   delaySeconds: number = 0,
+  messageDelaySeconds: number = 2,
   file?: File | null,
   onProgress?: (sent: number, total: number, status: string, nextBatchTime: Date | null) => void
 ): Promise<{ successful: string[]; failed: string[] }> => {
   const successful: string[] = [];
   const failed: string[] = [];
   const total = recipients.length;
+  let overallSentIndex = 0;
 
   for (let i = 0; i < total; i += batchSize) {
     const chunk = recipients.slice(i, i + batchSize);
@@ -178,15 +180,18 @@ export const sendBroadcastMessage = async (
         onProgress(successful.length + failed.length, total, 'Sending messages...', null);
       }
 
-      const result = await sendWhatsAppMessage(phone, message, file || undefined);
+      const currentMessage = messages[overallSentIndex % messages.length];
+      const result = await sendWhatsAppMessage(phone, currentMessage, file || undefined);
+      overallSentIndex++;
+
       if (result.success) {
         successful.push(phone);
       } else {
         failed.push(phone);
       }
 
-      // Small delay between individual messages to prevent flooding the backend
-      await new Promise(resolve => setTimeout(resolve, 500));
+      // Configurable gap between individual messages
+      await new Promise(resolve => setTimeout(resolve, messageDelaySeconds * 1000));
     }
 
     // If there are more batches left, apply the delay

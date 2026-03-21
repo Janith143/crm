@@ -13,7 +13,8 @@ const BroadcastPage: React.FC<BroadcastPageProps> = ({ teachers }) => {
   const { stages } = usePipeline();
   const [step, setStep] = useState(1);
   const [selectedSegment, setSelectedSegment] = useState<string>('All');
-  const [messageText, setMessageText] = useState('');
+  const [messageTemplates, setMessageTemplates] = useState<string[]>(['']);
+  const [activeTemplateIndex, setActiveTemplateIndex] = useState(0);
   const [aiTopic, setAiTopic] = useState('');
   const [isGenerating, setIsGenerating] = useState(false);
   const [isSending, setIsSending] = useState(false);
@@ -23,6 +24,7 @@ const BroadcastPage: React.FC<BroadcastPageProps> = ({ teachers }) => {
   const [batchSize, setBatchSize] = useState<number>(10);
   const [delayMinutes, setDelayMinutes] = useState<number>(10);
   const [delaySeconds, setDelaySeconds] = useState<number>(0);
+  const [messageDelaySeconds, setMessageDelaySeconds] = useState<number>(2);
   const [attachment, setAttachment] = useState<File | null>(null);
   const [progress, setProgress] = useState<{ sent: number; total: number; status: string; nextBatchTime: Date | null } | null>(null);
 
@@ -59,11 +61,16 @@ const BroadcastPage: React.FC<BroadcastPageProps> = ({ teachers }) => {
     if (!aiTopic) return;
     setIsGenerating(true);
     const template = await generateBroadcastTemplate(aiTopic, selectedSegment);
-    setMessageText(template);
+    const newTemplates = [...messageTemplates];
+    newTemplates[activeTemplateIndex] = template;
+    setMessageTemplates(newTemplates);
     setIsGenerating(false);
   };
 
   const handleSendBroadcast = async () => {
+    const validTemplates = messageTemplates.filter(t => t.trim() !== '');
+    if (validTemplates.length === 0) return;
+
     setIsSending(true);
     setProgress({ sent: 0, total: audience.length, status: 'Initializing...', nextBatchTime: null });
 
@@ -73,12 +80,13 @@ const BroadcastPage: React.FC<BroadcastPageProps> = ({ teachers }) => {
     // Send via service (handles real API if configured, otherwise simulates)
     const result = await sendBroadcastMessage(
       recipients,
-      messageText,
+      validTemplates,
       batchSize,
       delayMinutes,
       delaySeconds,
+      messageDelaySeconds,
       attachment,
-      (sent, total, status, nextBatchTime) => {
+      (sent: number, total: number, status: string, nextBatchTime: Date | null) => {
         setProgress({ sent, total, status, nextBatchTime });
       }
     );
@@ -103,7 +111,7 @@ const BroadcastPage: React.FC<BroadcastPageProps> = ({ teachers }) => {
           <span className="text-green-600 font-bold">{sendResult.success} sent</span> • <span className="text-red-500 font-bold">{sendResult.failed} failed</span>
         </p>
         <button
-          onClick={() => { setSendResult(null); setStep(1); setMessageText(''); setProgress(null); setAttachment(null); }}
+          onClick={() => { setSendResult(null); setStep(1); setMessageTemplates(['']); setActiveTemplateIndex(0); setProgress(null); setAttachment(null); }}
           className="bg-slate-900 text-white px-6 py-2 rounded-lg hover:bg-slate-800 transition-colors"
         >
           Send Another Campaign
@@ -201,16 +209,64 @@ const BroadcastPage: React.FC<BroadcastPageProps> = ({ teachers }) => {
                 </div>
 
                 <div className="mb-2">
-                  <label className="block text-sm font-medium text-slate-700 mb-2">Message Content</label>
+                  <div className="flex justify-between items-end mb-2">
+                    <label className="block text-sm font-medium text-slate-700">Message Variations</label>
+                    <button
+                      onClick={() => {
+                        setMessageTemplates([...messageTemplates, '']);
+                        setActiveTemplateIndex(messageTemplates.length);
+                      }}
+                      className="text-xs text-blue-600 hover:text-blue-700 font-medium flex items-center gap-1"
+                    >
+                      + Add Variation
+                    </button>
+                  </div>
+
+                  {messageTemplates.length > 1 && (
+                    <div className="flex gap-2 mb-3 overflow-x-auto pb-1">
+                      {messageTemplates.map((_, idx) => (
+                        <button
+                          key={idx}
+                          onClick={() => setActiveTemplateIndex(idx)}
+                          className={`px-3 py-1 text-xs rounded-full font-medium whitespace-nowrap ${activeTemplateIndex === idx
+                            ? 'bg-slate-800 text-white'
+                            : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                            }`}
+                        >
+                          Variation {idx + 1}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+
                   <textarea
-                    value={messageText}
-                    onChange={(e) => setMessageText(e.target.value)}
-                    className="w-full h-64 p-4 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50 focus:border-green-500 resize-none font-sans"
+                    value={messageTemplates[activeTemplateIndex]}
+                    onChange={(e) => {
+                      const newTemplates = [...messageTemplates];
+                      newTemplates[activeTemplateIndex] = e.target.value;
+                      setMessageTemplates(newTemplates);
+                    }}
+                    className="w-full h-48 p-4 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50 focus:border-green-500 resize-none font-sans"
                     placeholder="Hi {{name}}, check out our new LMS features..."
                   />
+                  {messageTemplates.length > 1 && (
+                    <div className="flex justify-end mt-2">
+                      <button
+                        onClick={() => {
+                          const newTemplates = messageTemplates.filter((_, i) => i !== activeTemplateIndex);
+                          setMessageTemplates(newTemplates);
+                          setActiveTemplateIndex(Math.max(0, activeTemplateIndex - 1));
+                        }}
+                        className="text-xs text-red-500 hover:text-red-600 font-medium"
+                      >
+                        Remove Variation
+                      </button>
+                    </div>
+                  )}
                 </div>
                 <div className="text-xs text-slate-500 mb-6">
-                  Supported variables: <code className="bg-slate-100 px-1 rounded">{`{{name}}`}</code>, <code className="bg-slate-100 px-1 rounded">{`{{phone}}`}</code>
+                  Supported variables: <code className="bg-slate-100 px-1 rounded">{`{{name}}`}</code>, <code className="bg-slate-100 px-1 rounded">{`{{phone}}`}</code><br />
+                  <span className="text-amber-600">If multiple variations are added, contacts will receive them in a rotating cycle to prevent bans.</span>
                 </div>
 
                 {/* Photo Attachment */}
@@ -274,7 +330,7 @@ const BroadcastPage: React.FC<BroadcastPageProps> = ({ teachers }) => {
                           <img src={URL.createObjectURL(attachment)} alt="Preview" className="w-full h-full object-cover" />
                         </div>
                       )}
-                      {messageText ? messageText.replace(/{{name}}/g, 'Nimal').replace(/{{phone}}/g, '0712345678') : <span className="text-slate-400 italic">Preview message here...</span>}
+                      {messageTemplates[activeTemplateIndex] ? messageTemplates[activeTemplateIndex].replace(/{{name}}/g, 'Nimal').replace(/{{phone}}/g, '0712345678') : <span className="text-slate-400 italic">Preview message here...</span>}
                       <div className="text-[10px] text-slate-400 text-right mt-1">10:30 AM</div>
                     </div>
                   </div>
@@ -289,7 +345,7 @@ const BroadcastPage: React.FC<BroadcastPageProps> = ({ teachers }) => {
                 <AlertCircle size={16} className="text-amber-500" />
                 Anti-Ban Rate Limiting
               </h4>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
                 <div>
                   <label className="block text-sm font-medium text-slate-700 mb-2">Contacts per batch</label>
                   <input
@@ -300,7 +356,7 @@ const BroadcastPage: React.FC<BroadcastPageProps> = ({ teachers }) => {
                     disabled={isSending}
                     className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:border-green-500 disabled:bg-slate-50 disabled:text-slate-500"
                   />
-                  <p className="text-xs text-slate-500 mt-1">Number of messages to send at once.</p>
+                  <p className="text-xs text-slate-500 mt-1">Messages to send at once.</p>
                 </div>
                 <div>
                   <label className="block text-sm font-medium text-slate-700 mb-2">Delay between batches</label>
@@ -327,13 +383,25 @@ const BroadcastPage: React.FC<BroadcastPageProps> = ({ teachers }) => {
                           value={delaySeconds}
                           onChange={(e) => setDelaySeconds(parseInt(e.target.value) || 0)}
                           disabled={isSending}
-                          className="w-full pl-3 pr-10 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:border-green-500 disabled:bg-slate-50 disabled:text-slate-500"
+                          className="w-full pl-3 pr-8 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:border-green-500 disabled:bg-slate-50 disabled:text-slate-500"
                         />
-                        <div className="absolute right-3 top-2 text-xs text-slate-400">sec</div>
+                        <div className="absolute right-2 top-2 text-xs text-slate-400">sec</div>
                       </div>
                     </div>
                   </div>
-                  <p className="text-xs text-slate-500 mt-1">Wait time before sending the next batch.</p>
+                  <p className="text-xs text-slate-500 mt-1">Wait time before next batch.</p>
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-slate-700 mb-2">Message gap (seconds)</label>
+                  <input
+                    type="number"
+                    min="1"
+                    value={messageDelaySeconds}
+                    onChange={(e) => setMessageDelaySeconds(parseInt(e.target.value) || 1)}
+                    disabled={isSending}
+                    className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:border-green-500 disabled:bg-slate-50 disabled:text-slate-500"
+                  />
+                  <p className="text-xs text-slate-500 mt-1">Delay between individual messages.</p>
                 </div>
               </div>
             </div>
@@ -383,7 +451,7 @@ const BroadcastPage: React.FC<BroadcastPageProps> = ({ teachers }) => {
                 </div>
                 <button
                   onClick={handleSendBroadcast}
-                  disabled={!messageText.trim() || isSending}
+                  disabled={!messageTemplates.some(t => t.trim() !== '') || isSending}
                   className="bg-green-600 text-white px-6 py-2 rounded-lg hover:bg-green-700 transition-colors flex items-center gap-2 shadow-sm disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   {isSending ? <Sparkles className="animate-spin" size={18} /> : <Send size={18} />}
