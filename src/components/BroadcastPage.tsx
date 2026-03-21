@@ -25,7 +25,7 @@ const BroadcastPage: React.FC<BroadcastPageProps> = ({ teachers }) => {
   const [delayMinutes, setDelayMinutes] = useState<number>(10);
   const [delaySeconds, setDelaySeconds] = useState<number>(0);
   const [messageDelaySeconds, setMessageDelaySeconds] = useState<number>(2);
-  const [attachment, setAttachment] = useState<File | null>(null);
+  const [attachments, setAttachments] = useState<(File | null)[]>([null]);
   const [progress, setProgress] = useState<{ sent: number; total: number; status: string; nextBatchTime: Date | null } | null>(null);
 
   // Determine audience based on selected segment (pipeline stage or tag)
@@ -68,8 +68,14 @@ const BroadcastPage: React.FC<BroadcastPageProps> = ({ teachers }) => {
   };
 
   const handleSendBroadcast = async () => {
-    const validTemplates = messageTemplates.filter(t => t.trim() !== '');
-    if (validTemplates.length === 0) return;
+    const validData = messageTemplates
+      .map((text, idx) => ({ text, file: attachments[idx] }))
+      .filter(t => t.text.trim() !== '');
+
+    if (validData.length === 0) return;
+
+    const validTemplates = validData.map(d => d.text);
+    const validAttachments = validData.map(d => d.file);
 
     setIsSending(true);
     setProgress({ sent: 0, total: audience.length, status: 'Initializing...', nextBatchTime: null });
@@ -85,7 +91,7 @@ const BroadcastPage: React.FC<BroadcastPageProps> = ({ teachers }) => {
       delayMinutes,
       delaySeconds,
       messageDelaySeconds,
-      attachment,
+      validAttachments,
       (sent: number, total: number, status: string, nextBatchTime: Date | null) => {
         setProgress({ sent, total, status, nextBatchTime });
       }
@@ -111,7 +117,7 @@ const BroadcastPage: React.FC<BroadcastPageProps> = ({ teachers }) => {
           <span className="text-green-600 font-bold">{sendResult.success} sent</span> • <span className="text-red-500 font-bold">{sendResult.failed} failed</span>
         </p>
         <button
-          onClick={() => { setSendResult(null); setStep(1); setMessageTemplates(['']); setActiveTemplateIndex(0); setProgress(null); setAttachment(null); }}
+          onClick={() => { setSendResult(null); setStep(1); setMessageTemplates(['']); setAttachments([null]); setActiveTemplateIndex(0); setProgress(null); }}
           className="bg-slate-900 text-white px-6 py-2 rounded-lg hover:bg-slate-800 transition-colors"
         >
           Send Another Campaign
@@ -255,6 +261,8 @@ const BroadcastPage: React.FC<BroadcastPageProps> = ({ teachers }) => {
                         onClick={() => {
                           const newTemplates = messageTemplates.filter((_, i) => i !== activeTemplateIndex);
                           setMessageTemplates(newTemplates);
+                          const newAttachments = attachments.filter((_, i) => i !== activeTemplateIndex);
+                          setAttachments(newAttachments);
                           setActiveTemplateIndex(Math.max(0, activeTemplateIndex - 1));
                         }}
                         className="text-xs text-red-500 hover:text-red-600 font-medium"
@@ -272,7 +280,7 @@ const BroadcastPage: React.FC<BroadcastPageProps> = ({ teachers }) => {
                 {/* Photo Attachment */}
                 <div className="mb-4">
                   <label className="block text-sm font-medium text-slate-700 mb-2">Photo Attachment (Optional)</label>
-                  {!attachment ? (
+                  {!attachments[activeTemplateIndex] ? (
                     <div className="border-2 border-dashed border-slate-300 rounded-lg p-6 text-center hover:bg-slate-50 transition-colors">
                       <input
                         type="file"
@@ -281,7 +289,9 @@ const BroadcastPage: React.FC<BroadcastPageProps> = ({ teachers }) => {
                         className="hidden"
                         onChange={(e) => {
                           if (e.target.files && e.target.files[0]) {
-                            setAttachment(e.target.files[0]);
+                            const newAttachments = [...attachments];
+                            newAttachments[activeTemplateIndex] = e.target.files[0];
+                            setAttachments(newAttachments);
                           }
                         }}
                         disabled={isSending}
@@ -290,21 +300,25 @@ const BroadcastPage: React.FC<BroadcastPageProps> = ({ teachers }) => {
                         <div className="w-10 h-10 bg-blue-50 text-blue-500 rounded-full flex items-center justify-center">
                           <ImageIcon size={20} />
                         </div>
-                        <span className="text-sm font-medium text-slate-600">Click to upload an image</span>
+                        <span className="text-sm font-medium text-slate-600">Click to upload an image for Variation {activeTemplateIndex + 1}</span>
                         <span className="text-xs text-slate-400">JPG, PNG, GIF up to 5MB</span>
                       </label>
                     </div>
                   ) : (
                     <div className="flex items-center gap-4 bg-slate-50 border border-slate-200 rounded-lg p-3">
                       <div className="w-12 h-12 bg-slate-200 rounded overflow-hidden flex-shrink-0">
-                        <img src={URL.createObjectURL(attachment)} alt="Attachment preview" className="w-full h-full object-cover" />
+                        <img src={URL.createObjectURL(attachments[activeTemplateIndex]!)} alt="Attachment preview" className="w-full h-full object-cover" />
                       </div>
                       <div className="flex-1 min-w-0">
-                        <p className="text-sm font-medium text-slate-800 truncate">{attachment.name}</p>
-                        <p className="text-xs text-slate-500">{(attachment.size / 1024 / 1024).toFixed(2)} MB</p>
+                        <p className="text-sm font-medium text-slate-800 truncate">{attachments[activeTemplateIndex]!.name}</p>
+                        <p className="text-xs text-slate-500">{(attachments[activeTemplateIndex]!.size / 1024 / 1024).toFixed(2)} MB</p>
                       </div>
                       <button
-                        onClick={() => setAttachment(null)}
+                        onClick={() => {
+                          const newAttachments = [...attachments];
+                          newAttachments[activeTemplateIndex] = null;
+                          setAttachments(newAttachments);
+                        }}
                         disabled={isSending}
                         className="p-2 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors flex-shrink-0"
                         title="Remove attachment"
@@ -325,9 +339,9 @@ const BroadcastPage: React.FC<BroadcastPageProps> = ({ teachers }) => {
                   </div>
                   <div className="bg-[#efeae2] h-[350px] p-4 relative overflow-y-auto custom-scrollbar">
                     <div className="bg-white p-2 text-slate-800 rounded-lg rounded-tl-none shadow-sm text-sm mb-2 whitespace-pre-wrap">
-                      {attachment && (
+                      {attachments[activeTemplateIndex] && (
                         <div className="w-full h-32 bg-slate-100 rounded mb-2 overflow-hidden border border-slate-200">
-                          <img src={URL.createObjectURL(attachment)} alt="Preview" className="w-full h-full object-cover" />
+                          <img src={URL.createObjectURL(attachments[activeTemplateIndex]!)} alt="Preview" className="w-full h-full object-cover" />
                         </div>
                       )}
                       {messageTemplates[activeTemplateIndex] ? messageTemplates[activeTemplateIndex].replace(/{{name}}/g, 'Nimal').replace(/{{phone}}/g, '0712345678') : <span className="text-slate-400 italic">Preview message here...</span>}
