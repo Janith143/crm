@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express from 'express';
 import whatsappWeb from 'whatsapp-web.js';
 import qrcode from 'qrcode';
@@ -6,24 +7,22 @@ import pool from './db.js';
 import { MOCK_AUTOMATION_RULES, MOCK_TEACHER_METADATA, MOCK_PIPELINE_STAGES } from './mockData.js';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
+import { createServer } from 'http';
+import { Server } from 'socket.io';
+import multer from 'multer';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Handle CommonJS export from whatsapp-web.js
-const { Client, LocalAuth } = whatsappWeb;
-
-import bcrypt from 'bcryptjs';
-import jwt from 'jsonwebtoken';
-
-import { createServer } from 'http';
-import { Server } from 'socket.io';
+const { Client, LocalAuth, MessageMedia } = whatsappWeb;
 
 const app = express();
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
     cors: {
-        origin: "*", // Allow all origins for now (dev)
+        origin: "*",
         methods: ["GET", "POST"]
     }
 });
@@ -35,6 +34,24 @@ const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-producti
 app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'dist')));
+
+// Configure Multer for memory storage
+const upload = multer({ storage: multer.memoryStorage() });
+
+// Helper to get settings
+const getAppSettings = async () => {
+    try {
+        const [rows] = await pool.query('SELECT * FROM app_settings');
+        const settings = {};
+        rows.forEach(row => {
+            settings[row.setting_key] = row.setting_value;
+        });
+        return settings;
+    } catch (e) {
+        console.warn("Failed to fetch settings, returning empty object", e.message);
+        return {};
+    }
+};
 
 // --- Auth Middleware ---
 const authenticateToken = (req, res, next) => {
@@ -56,9 +73,7 @@ const authenticateToken = (req, res, next) => {
 app.post('/api/login', async (req, res) => {
     const { username, password } = req.body;
     try {
-        // Check if it's the initial admin setup
         if (username === 'admin' && password === 'admin123') {
-            // Check if admin exists in DB, if not create it
             const [rows] = await pool.query('SELECT * FROM users WHERE username = ?', ['admin']);
             if (rows.length === 0) {
                 const hashedPassword = await bcrypt.hash('admin123', 10);
@@ -143,12 +158,11 @@ app.delete('/api/users/:id', authenticateToken, async (req, res) => {
 });
 
 // WhatsApp Client Setup
-// LocalAuth stores the session on disk so you don't have to scan QR every time you restart
 const client = new Client({
     restartOnAuthFail: true,
     authStrategy: new LocalAuth(),
     puppeteer: {
-        headless: true, // Change to false to debug visually
+        headless: true,
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
@@ -162,15 +176,8 @@ const client = new Client({
             '--mute-audio',
             '--disable-background-timer-throttling',
             '--disable-backgrounding-occluded-windows',
-            '--disable-features=IsolateOrigins,site-per-process',
-            '--disable-sync',
-            '--hide-scrollbars',
-            '--disable-default-apps',
-            '--disable-ipc-flooding-protection',
-            '--disable-background-networking',
-            '--disable-domain-reliability',
-            '--disable-translate'
-            // Removed --single-process to avoid deadlocks
+            '--disable-site-isolation-trials',
+            '--disable-sync'
         ]
     }
 });
@@ -182,8 +189,7 @@ let isAuthenticated = false;
 
 // Events
 client.on('qr', (qr) => {
-    console.log('QR RECEIVED', qr);
-    qrCodeData = qr; // Store raw content for potential debug, but we usually store dataURL
+    console.log('QR RECEIVED');
     qrcode.toDataURL(qr, (err, url) => {
         qrCodeData = url;
         io.emit('qr', { qr: url });
@@ -194,11 +200,10 @@ let readyTimeout = null;
 
 client.on('ready', () => {
     if (readyTimeout) clearTimeout(readyTimeout);
-    console.log('Client is ready! (Native Event)');
+    console.log('Client is ready!');
     isClientReady = true;
-    isAuthenticated = true; // Ensure this is true
+    isAuthenticated = true;
     io.emit('status', { connected: true, authenticated: true });
-    // Initial sync
     syncChats();
     processPendingMessages();
     clientInfo = {
@@ -207,33 +212,20 @@ client.on('ready', () => {
     };
 });
 
-
 client.on('authenticated', () => {
     console.log('AUTHENTICATED');
     isAuthenticated = true;
-    qrCodeData = null; // Clear QR
+    qrCodeData = null;
     io.emit('authenticated', { authenticated: true });
 
-    // Force ready after 30s if it gets stuck (increased from 15s)
     if (readyTimeout) clearTimeout(readyTimeout);
     readyTimeout = setTimeout(() => {
         if (!isClientReady) {
             console.warn('⚠️ Force-triggering READY state due to timeout.');
             isClientReady = true;
             io.emit('status', { connected: true, authenticated: true });
-
-            // Trigger Syncs even on forced ready
-            console.log('🔄 Triggering forced sync...');
             syncChats();
             processPendingMessages();
-
-            // Retry sync after 10 more seconds (allow Store to fully populate)
-            setTimeout(() => {
-                console.log('🔄 Retry sync after delay...');
-                syncChats();
-            }, 10000);
-
-            // Try to set client info if available
             if (client.info) {
                 clientInfo = {
                     number: client.info.wid.user,
@@ -252,62 +244,26 @@ client.on('auth_failure', msg => {
     io.emit('auth_failure', { message: msg });
 });
 
-client.on('loading_screen', (percent, message) => {
-    console.log('LOADING SCREEN', percent, message);
-    io.emit('loading_screen', { percent, message });
-});
-
 client.on('disconnected', (reason) => {
     console.log('Client was logged out', reason);
     isClientReady = false;
     clientInfo = null;
-    // Re-initialize to allow new login
     client.initialize();
 });
 
 // Queue Processor
 const processPendingMessages = async () => {
     if (!isClientReady) return;
-    console.log("🔄 Processing pending messages queue...");
-
     try {
         const [rows] = await pool.query("SELECT * FROM messages WHERE status = 'pending' ORDER BY timestamp ASC");
-        if (rows.length === 0) {
-            console.log("✅ No pending messages to send");
-            return;
-        }
-
-        console.log(`found ${rows.length} pending messages`);
-
         for (const msg of rows) {
-            console.log(`Processing pending msg ${msg.id} to ${msg.chat_id}`);
             try {
-                const chatId = msg.chat_id;
-                const message = msg.body;
-
-                // Construct options (quoted msg, etc) - simplified for restoration
-                // In a full implementation we'd store these options in a separate column or JSON
-                const options = {};
-
-                const response = await client.sendMessage(chatId, message, options);
-
-                // Update status to sent
+                await client.sendMessage(msg.chat_id, msg.body);
                 await pool.query("UPDATE messages SET status = 'sent', ack = 1 WHERE id = ?", [msg.id]);
-
-                // Emit update
-                io.emit('message_update', {
-                    id: msg.id,
-                    status: 'sent',
-                    ack: 1
-                });
-
-                // Small delay to ensure sequence and respect rate limits
+                io.emit('message_update', { id: msg.id, status: 'sent', ack: 1 });
                 await new Promise(resolve => setTimeout(resolve, 1000));
-
             } catch (err) {
                 console.error(`Failed to send pending msg ${msg.id}`, err);
-                // Optionally mark as failed or leave pending for next retry?
-                // For now, let's leave it pending but maybe add a retry count later
             }
         }
     } catch (error) {
@@ -315,71 +271,23 @@ const processPendingMessages = async () => {
     }
 };
 
-// Events
 client.on('message_ack', async (msg, ack) => {
-    /*
-        ack values:
-        1: sent
-        2: received
-        3: read
-    */
     const status = ack === 3 ? 'read' : ack === 2 ? 'received' : 'sent';
     try {
         await pool.query('UPDATE messages SET ack = ?, status = ? WHERE id = ?', [ack, status, msg.id.id]);
-        // console.log(`Updated ack for ${msg.id.id} to ${status}`);
-
-        // --- Emit Real-time Event ---
-        io.emit('message_update', {
-            id: msg.id.id,
-            status: status,
-            ack: ack
-        });
+        io.emit('message_update', { id: msg.id.id, status, ack });
     } catch (e) {
         console.error("Failed to update ack", e);
     }
 });
 
-
-// --- Automation Logic ---
-// Rules will be fetched from DB
-
-// Shared handler for both incoming (message) and outgoing (message_create) messages
+// Shared handler for messages
 async function handleIncomingOrCreatedMessage(msg, eventSource = 'message_create') {
-    console.log(`📩 [${eventSource}] Message received: id=${msg.id.id}, from=${msg.from}, fromMe=${msg.fromMe}, type=${msg.type}`);
-    // Ignore messages from self (handled separately or if we want to store them too)
-    // Actually message_create fires for own messages too.
-
     let actualBody = msg.body;
     let actualType = msg.type;
-
-    // Check for Facebook Boosted Post / Ad context
-    const dynamicContext = msg.dynamicReplyContext || (msg._data && msg._data.dynamicReplyContext);
-    if (dynamicContext) {
-        const title = dynamicContext.title || "Ads";
-        const adMessage = `[FB Ad Reply: ${title}]`;
-        if (!actualBody) actualBody = adMessage;
-        else actualBody = `${adMessage}\n\n${actualBody}`;
-        actualType = 'ad_reply';
-    }
-
-    // Fallback for quotedAd if dynamicReplyContext is missing
-    const quotedAd = msg.quotedAd || (msg._data && msg._data.quotedAd);
-    if (quotedAd && !dynamicContext) {
-        const title = quotedAd.title || "Ads";
-        const adMessage = `[FB Ad Reply: ${title}]`;
-        if (!actualBody) actualBody = adMessage;
-        else actualBody = `${adMessage}\n\n${actualBody}`;
-        actualType = 'ad_reply';
-    }
-
-    const body = (actualBody || '').toLowerCase();
-    const userId = msg.from; // Phone number (e.g. 9477...@c.us)
     const chatId = msg.id.remote;
 
-    // Extract quoted message context (if any)
-    let quotedMsgId = null;
-    let quotedMsgBody = null;
-    let quotedMsgSender = null;
+    let quotedMsgId = null, quotedMsgBody = null, quotedMsgSender = null;
     try {
         if (msg.hasQuotedMsg) {
             const quotedMsg = await msg.getQuotedMessage();
@@ -389,2054 +297,462 @@ async function handleIncomingOrCreatedMessage(msg, eventSource = 'message_create
                 quotedMsgSender = quotedMsg.fromMe ? 'agent' : (quotedMsg.author || quotedMsg.from || 'teacher');
             }
         }
-    } catch (qErr) {
-        console.warn('Could not extract quoted message:', qErr.message);
-    }
+    } catch (e) { }
 
     try {
         await pool.query(
-            `INSERT INTO messages (id, chat_id, sender_id, from_me, body, timestamp, status, type, has_media, ack, quoted_msg_id, quoted_msg_body, quoted_msg_sender) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `INSERT INTO messages (id, chat_id, sender_id, from_me, body, timestamp, status, type, has_media, ack, quoted_msg_id, quoted_msg_body, quoted_msg_sender) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON DUPLICATE KEY UPDATE body = VALUES(body), status = VALUES(status), ack = VALUES(ack), type = VALUES(type), has_media = VALUES(has_media)`,
-            [
-                msg.id.id,
-                chatId,
-                msg.author || msg.from,
-                msg.fromMe,
-                actualBody,
-                msg.timestamp,
-                msg.ack === 3 ? 'read' : msg.ack === 2 ? 'received' : 'sent',
-                actualType,
-                msg.hasMedia,
-                msg.ack,
-                quotedMsgId,
-                quotedMsgBody,
-                quotedMsgSender
-            ]
+            [msg.id.id, chatId, msg.author || msg.from, msg.fromMe, actualBody, msg.timestamp, msg.ack === 3 ? 'read' : msg.ack === 2 ? 'received' : 'sent', actualType, msg.hasMedia, msg.ack, quotedMsgId, quotedMsgBody, quotedMsgSender]
         );
-        // console.log(`💾 Saved message ${msg.id.id} to DB`);
 
-        // --- Upsert Chat Entry (populate chats dynamically) ---
+        let chatName = '';
         try {
-            // Get chat info if possible, otherwise use basic info
-            let chatName = '';
-            try {
-                const contact = await msg.getContact();
-                chatName = contact.pushname || contact.name || contact.number || '';
-            } catch (e) {
-                chatName = chatId.replace('@c.us', '').replace('@g.us', '');
-            }
-
-            await pool.query(
-                `INSERT INTO chats (id, name, unread_count, timestamp, last_message, last_message_type, last_message_status, last_message_from_me)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                 ON DUPLICATE KEY UPDATE
-                 timestamp = VALUES(timestamp),
-                 last_message = VALUES(last_message),
-                 last_message_type = VALUES(last_message_type),
-                 last_message_status = VALUES(last_message_status),
-                 last_message_from_me = VALUES(last_message_from_me),
-                 unread_count = IF(VALUES(last_message_from_me) = 0, unread_count + 1, 0)`,
-                [
-                    chatId,
-                    chatName,
-                    msg.fromMe ? 0 : 1, // Unread if incoming
-                    msg.timestamp,
-                    actualBody || (msg.hasMedia ? '📷 Media' : ''),
-                    actualType,
-                    msg.ack || 0,
-                    msg.fromMe
-                ]
-            );
-            // console.log(`💬 Upserted chat ${chatId}`);
-        } catch (chatErr) {
-            console.warn(`Failed to upsert chat: ${chatErr.message}`);
+            const contact = await msg.getContact();
+            chatName = contact.pushname || contact.name || contact.number || '';
+        } catch (e) {
+            chatName = chatId.replace('@c.us', '').replace('@g.us', '');
         }
 
-        // --- Emit Real-time Event ---
+        await pool.query(
+            `INSERT INTO chats (id, name, unread_count, timestamp, last_message, last_message_type, last_message_status, last_message_from_me)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE timestamp = VALUES(timestamp), last_message = VALUES(last_message), last_message_type = VALUES(last_message_type), last_message_status = VALUES(last_message_status), last_message_from_me = VALUES(last_message_from_me), unread_count = IF(VALUES(last_message_from_me) = 0, unread_count + 1, 0)`,
+            [chatId, chatName, msg.fromMe ? 0 : 1, msg.timestamp, actualBody || (msg.hasMedia ? '📷 Media' : ''), actualType, msg.ack || 0, msg.fromMe]
+        );
+
         io.emit('message_new', {
-            id: msg.id.id,
-            chatId: chatId,
-            senderId: msg.fromMe ? 'agent' : 'teacher', // simplified
-            text: actualBody,
+            id: msg.id.id, chatId, senderId: msg.fromMe ? 'agent' : 'teacher', text: actualBody,
             timestamp: new Date(msg.timestamp * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-            isIncoming: !msg.fromMe,
-            status: msg.ack === 3 ? 'read' : msg.ack === 2 ? 'received' : 'sent',
-            type: actualType,
-            hasMedia: msg.hasMedia,
-            mediaType: actualType,
-            quotedMessage: quotedMsgId ? {
-                id: quotedMsgId,
-                body: quotedMsgBody,
-                senderId: quotedMsgSender
-            } : undefined
+            isIncoming: !msg.fromMe, status: msg.ack === 3 ? 'read' : msg.ack === 2 ? 'received' : 'sent',
+            type: actualType, hasMedia: msg.hasMedia, mediaType: actualType,
+            quotedMessage: quotedMsgId ? { id: quotedMsgId, body: quotedMsgBody, senderId: quotedMsgSender } : undefined
         });
 
     } catch (dbErr) {
         console.error(`❌ Failed to save message ${msg.id.id} to DB:`, dbErr.message);
     }
 
-    if (msg.fromMe) return; // Stop automation for own messages
-
-    // Only process text-based messages for automation
+    if (msg.fromMe) return;
+    const body = (actualBody || '').toLowerCase();
     if (!body.trim()) return;
 
-    console.log(`[AUTOMATION] Incoming from ${userId}: "${body}"`);
-
-    // 1. Check for "Live Chat" stop condition
     if (body.includes('live chat') || body.includes('livechat')) {
-        console.log(`🛑 User ${userId} requested Live Chat. Stopping automation.`);
-        try {
-            await pool.query('DELETE FROM automation_sessions WHERE user_id = ?', [userId]);
-            await msg.reply("Connecting you to a human agent. Automation stopped.");
-        } catch (e) {
-            console.error("Failed to clear session", e);
-        }
+        await pool.query('DELETE FROM automation_sessions WHERE user_id = ?', [msg.from]);
+        await msg.reply("Connecting you to a human agent. Automation stopped.");
         return;
     }
 
+    // --- Automation Sessions ---
     try {
-        // 2. Check if user is in an active session
-        let session = null;
-        try {
-            const [rows] = await pool.query('SELECT * FROM automation_sessions WHERE user_id = ?', [userId]);
-            if (rows.length > 0) {
-                session = rows[0];
-            }
-        } catch (e) { /* Ignore DB error */ }
-
-        if (session) {
-            console.log(`🔄 Found active session for ${userId}: Workflow ${session.workflow_id}, Step ${session.current_step_index}`);
-            // User is in a flow. Fetch the workflow.
+        const [sessionRows] = await pool.query('SELECT * FROM automation_sessions WHERE user_id = ?', [msg.from]);
+        if (sessionRows.length > 0) {
+            const session = sessionRows[0];
             const [rules] = await pool.query('SELECT * FROM automation_rules WHERE id = ?', [session.workflow_id]);
             if (rules.length > 0) {
-                const rule = rules[0];
-                const steps = typeof rule.steps === 'string' ? JSON.parse(rule.steps) : rule.steps;
-
-                console.log(`📜 Loaded workflow steps: ${steps.length}`);
-
-                // Find current step
-                // If current_step_index is stored, use it. But we moved to IDs.
-                // Let's assume current_step_index stores the ID now if it's a string, or we need to map it.
-                // For simplicity, let's look for the step with ID = current_step_index (casted to string)
-
-                const currentStepId = session.current_step_index.toString();
-                const currentStep = steps.find(s => s.id === currentStepId);
-
-                if (!currentStep) {
-                    console.warn(`⚠️ Current step ${currentStepId} not found in workflow. Ending session.`);
-                    await pool.query('DELETE FROM automation_sessions WHERE user_id = ?', [userId]);
-                    return;
-                }
-
-                console.log(`📍 Current Step: ${currentStep.id} - ${currentStep.content}`);
-
-                if (currentStep && currentStep.options && currentStep.options.length > 0) {
-                    console.log(`🔀 Checking options: ${JSON.stringify(currentStep.options)}`);
-                    // Check if user reply matches any option
-                    const matchedOption = currentStep.options.find(opt => body.includes(opt.keyword.toLowerCase()));
-
+                const steps = JSON.parse(rules[0].steps || '[]');
+                const currentStep = steps.find(s => s.id === session.current_step_index.toString());
+                if (currentStep) {
+                    const matchedOption = currentStep.options?.find(opt => body.includes(opt.keyword.toLowerCase()));
                     if (matchedOption) {
-                        console.log(`✅ Matched option: ${matchedOption.keyword} -> Go to ${matchedOption.nextStepId}`);
                         const nextStep = steps.find(s => s.id === matchedOption.nextStepId);
                         if (nextStep) {
-                            console.log(`➡️ Branching flow for ${userId}: Step ${nextStep.id}`);
                             await msg.reply(nextStep.content);
-
-                            // Update session
-                            await pool.query('UPDATE automation_sessions SET current_step_index = ?, last_interaction = NOW() WHERE user_id = ?', [nextStep.id, userId]);
+                            await pool.query('UPDATE automation_sessions SET current_step_index = ?, last_interaction = NOW() WHERE user_id = ?', [nextStep.id, msg.from]);
                             return;
-                        } else {
-                            console.warn(`⚠️ Next step ${matchedOption.nextStepId} not found.`);
                         }
-                    } else {
-                        console.log(`❌ No option matched for "${body}"`);
+                    } else if (!currentStep.options || currentStep.options.length === 0) {
+                        const currentIdx = steps.findIndex(s => s.id === currentStep.id);
+                        if (currentIdx < steps.length - 1) {
+                            const nextStep = steps[currentIdx + 1];
+                            await msg.reply(nextStep.content);
+                            await pool.query('UPDATE automation_sessions SET current_step_index = ?, last_interaction = NOW() WHERE user_id = ?', [nextStep.id, msg.from]);
+                            return;
+                        }
                     }
                 }
-
-                // Fallback: Linear progression if no options or no match (and we want to support linear mixed with branching)
-                // OR if it was a linear step, just go to next index?
-                // For now, let's assume if it has options, it MUST match an option.
-                // If it doesn't have options, maybe it just waits for ANY reply to go to next?
-
-                if (!currentStep.options || currentStep.options.length === 0) {
-                    // Linear fallback: Find step with ID = current + 1? 
-                    // Or find index of current step and go to index + 1
-                    const currentIndex = steps.findIndex(s => s.id === currentStepId);
-                    console.log(`➡️ Linear check. Current Index: ${currentIndex}, Total: ${steps.length}`);
-                    if (currentIndex !== -1 && currentIndex < steps.length - 1) {
-                        const nextStep = steps[currentIndex + 1];
-                        console.log(`➡️ Linear flow for ${userId}: Step ${nextStep.id}`);
-                        await msg.reply(nextStep.content);
-                        await pool.query('UPDATE automation_sessions SET current_step_index = ?, last_interaction = NOW() WHERE user_id = ?', [nextStep.id, userId]);
-                        return;
-                    }
-                }
-
-                // If we are here, either flow ended or invalid option
-                if (currentStep.options && currentStep.options.length > 0) {
-                    console.log(`ℹ️ User reply did not match any option. Ignoring or sending fallback.`);
-                    // await msg.reply("Please select a valid option.");
-                    return;
-                }
-
-                // End of flow
-                console.log(`✅ Flow completed for ${userId}`);
-                await pool.query('DELETE FROM automation_sessions WHERE user_id = ?', [userId]);
-                return;
-            } else {
-                console.warn(`⚠️ Workflow ${session.workflow_id} not found. Deleting session.`);
-                // Rule deleted? Clear session.
-                await pool.query('DELETE FROM automation_sessions WHERE user_id = ?', [userId]);
             }
-        } else {
-            console.log(`ℹ️ No active session for ${userId}`);
+            await pool.query('DELETE FROM automation_sessions WHERE user_id = ?', [msg.from]);
         }
 
-        // 3. Check for new triggers (Start new flow)
-        let rules;
-        try {
-            const [rows] = await pool.query('SELECT * FROM automation_rules WHERE active = 1');
-            rules = rows;
-        } catch (dbError) {
-            console.warn("⚠️ DB Connection Failed (Automation Logic). Using Mock Data.");
-            rules = MOCK_AUTOMATION_RULES;
-        }
-
-        for (const rule of rules) {
-            let match = false;
-            if (rule.match_type === 'exact') {
-                match = body === rule.trigger_text.toLowerCase();
-            } else {
-                match = body.includes(rule.trigger_text.toLowerCase());
-            }
-
+        const [activeRules] = await pool.query('SELECT * FROM automation_rules WHERE active = 1');
+        for (const rule of activeRules) {
+            const match = rule.match_type === 'exact' ? body === rule.trigger_text.toLowerCase() : body.includes(rule.trigger_text.toLowerCase());
             if (match) {
-                console.log(`Triggering rule: ${rule.name}`);
-                try {
-                    // Parse steps
-                    const steps = typeof rule.steps === 'string' ? JSON.parse(rule.steps) : rule.steps;
-
-                    // If new format (WorkflowStep[]), use content. If old (string[]), use string.
-                    // We normalized frontend to send WorkflowStep[].
-                    // But DB might have old data.
-
-                    let firstStepContent = rule.response_text;
-                    let firstStepId = '0';
-
-                    if (steps && steps.length > 0) {
-                        if (typeof steps[0] === 'object') {
-                            firstStepContent = steps[0].content;
-                            firstStepId = steps[0].id;
-                        } else {
-                            firstStepContent = steps[0];
-                        }
-                    }
-
-                    await msg.reply(firstStepContent);
-
-                    // Update hit count
-                    pool.query('UPDATE automation_rules SET hit_count = hit_count + 1 WHERE id = ?', [rule.id]).catch(() => { });
-
-                    // Start Session if there are more steps or options
-                    if (steps && steps.length > 0) {
-                        // Check if single step has options OR if there are multiple steps
-                        const hasOptions = typeof steps[0] === 'object' && steps[0].options && steps[0].options.length > 0;
-                        if (steps.length > 1 || hasOptions) {
-                            console.log(`🆕 Starting new session for ${userId} on Workflow ${rule.id}`);
-                            await pool.query(
-                                'INSERT INTO automation_sessions (user_id, workflow_id, current_step_index) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE workflow_id = ?, current_step_index = ?',
-                                [userId, rule.id, firstStepId, rule.id, firstStepId]
-                            );
-                        }
-                    }
-
-                } catch (e) {
-                    console.error('Failed to send auto-reply', e);
+                const steps = JSON.parse(rule.steps || '[]');
+                let content = rule.response_text;
+                let stepId = '0';
+                if (steps.length > 0) { content = steps[0].content; stepId = steps[0].id; }
+                await msg.reply(content);
+                await pool.query('UPDATE automation_rules SET hit_count = hit_count + 1 WHERE id = ?', [rule.id]);
+                if (steps.length > 1 || (steps[0] && steps[0].options?.length > 0)) {
+                    await pool.query('INSERT INTO automation_sessions (user_id, workflow_id, current_step_index) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE workflow_id = ?, current_step_index = ?',
+                        [msg.from, rule.id, stepId, rule.id, stepId]);
                 }
-                break; // Stop after first match
+                break;
             }
         }
-    } catch (error) {
-        console.error('Error in automation logic:', error);
+    } catch (e) {
+        console.error('Automation error:', e);
     }
 }
 
-// Primary listener for INCOMING messages — most reliable for inbound
-client.on('message', async (msg) => {
-    await handleIncomingOrCreatedMessage(msg, 'message');
-});
+client.on('message', msg => handleIncomingOrCreatedMessage(msg, 'message'));
+client.on('message_create', msg => { if (msg.fromMe) handleIncomingOrCreatedMessage(msg, 'message_create'); });
 
-// Listener for OUTGOING messages (fromMe) — message_create fires for both but
-// we only use it for outgoing to avoid duplicate processing of incoming messages
-client.on('message_create', async (msg) => {
-    if (!msg.fromMe) return; // Incoming already handled by 'message' event above
-    await handleIncomingOrCreatedMessage(msg, 'message_create');
-});
-
-// --- API Endpoints for Frontend ---
-
-// 0. Automation Endpoints
-// 0.4 Automation Endpoints
+// --- Automation API ---
 app.get('/api/automations', async (req, res) => {
     try {
-        let rules;
-        try {
-            const [rows] = await pool.query('SELECT * FROM automation_rules');
-            rules = rows;
-        } catch (dbError) {
-            console.warn("⚠️ DB Connection Failed (Get Automations). Using Mock Data.");
-            rules = MOCK_AUTOMATION_RULES;
-        }
-
-        const formattedRules = rules.map(r => ({
-            id: r.id,
-            name: r.name,
-            trigger: r.trigger_text,
-            response: r.response_text,
-            active: !!r.active,
-            matchType: r.match_type,
-            hitCount: r.hit_count,
-            steps: typeof r.steps === 'string' ? JSON.parse(r.steps) : r.steps
-        }));
-        res.json({ success: true, rules: formattedRules });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
+        const [rows] = await pool.query('SELECT * FROM automation_rules');
+        res.json({
+            success: true, rules: rows.map(r => ({
+                id: r.id, name: r.name, trigger: r.trigger_text, response: r.response_text,
+                active: !!r.active, matchType: r.match_type, hitCount: r.hit_count,
+                steps: JSON.parse(r.steps || '[]')
+            }))
+        });
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/automations', async (req, res) => {
     const { name, trigger, response, matchType, steps } = req.body;
     const id = Date.now().toString();
     try {
-        const stepsToSave = steps || [response];
-        await pool.query(
-            'INSERT INTO automation_rules (id, name, trigger_text, response_text, match_type, steps) VALUES (?, ?, ?, ?, ?, ?)',
-            [id, name, trigger, response, matchType || 'contains', JSON.stringify(stepsToSave)]
-        );
-        res.json({ success: true, rule: { id, name, trigger, response, active: true, matchType, hitCount: 0, steps: stepsToSave } });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-// 0.4.1 Debug: Test automation matching with a text body
-app.post('/api/debug/automation', async (req, res) => {
-    const { text } = req.body;
-    if (!text) return res.status(400).json({ error: 'text field required' });
-    const lc = text.toLowerCase();
-    try {
-        const [rules] = await pool.query('SELECT * FROM automation_rules WHERE active = 1');
-        const matches = rules.filter(r => {
-            if (r.match_type === 'exact') return lc === r.trigger_text.toLowerCase();
-            return lc.includes(r.trigger_text.toLowerCase());
-        });
-        res.json({ success: true, tested: text, activeRules: rules.length, matches: matches.map(r => ({ id: r.id, name: r.name, trigger: r.trigger_text })) });
-    } catch (e) {
-        res.status(500).json({ success: false, error: e.message });
-    }
-});
-
-// 0.4.2 Debug: Server status
-app.get('/api/debug/status', (req, res) => {
-    res.json({ isClientReady, isAuthenticated, clientInfo });
+        await pool.query('INSERT INTO automation_rules (id, name, trigger_text, response_text, match_type, steps) VALUES (?, ?, ?, ?, ?, ?)',
+            [id, name, trigger, response, matchType || 'contains', JSON.stringify(steps || [])]);
+        res.json({ success: true, id });
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.put('/api/automations/:id', async (req, res) => {
     const { id } = req.params;
-    const { name, trigger, response, active, matchType } = req.body;
-
+    const { name, trigger, response, active, matchType, steps } = req.body;
     try {
-        // Build query dynamically based on what's provided
-        const updates = [];
-        const values = [];
+        const updates = []; const values = [];
         if (name !== undefined) { updates.push('name = ?'); values.push(name); }
         if (trigger !== undefined) { updates.push('trigger_text = ?'); values.push(trigger); }
         if (response !== undefined) { updates.push('response_text = ?'); values.push(response); }
         if (active !== undefined) { updates.push('active = ?'); values.push(active ? 1 : 0); }
         if (matchType !== undefined) { updates.push('match_type = ?'); values.push(matchType); }
-        if (req.body.steps !== undefined) { updates.push('steps = ?'); values.push(JSON.stringify(req.body.steps)); }
-
-        if (updates.length > 0) {
-            values.push(id);
-            await pool.query(`UPDATE automation_rules SET ${updates.join(', ')} WHERE id = ?`, values);
-        }
+        if (steps !== undefined) { updates.push('steps = ?'); values.push(JSON.stringify(steps)); }
+        if (updates.length > 0) { values.push(id); await pool.query(`UPDATE automation_rules SET ${updates.join(', ')} WHERE id = ?`, values); }
         res.json({ success: true });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.delete('/api/automations/:id', async (req, res) => {
-    const { id } = req.params;
-    try {
-        await pool.query('DELETE FROM automation_rules WHERE id = ?', [id]);
-        res.json({ success: true });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
+    try { await pool.query('DELETE FROM automation_rules WHERE id = ?', [req.params.id]); res.json({ success: true }); }
+    catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 0.4.5 Message Templates Endpoints
+// --- Templates ---
 app.get('/api/templates', async (req, res) => {
     try {
-        // Create table if not exists (Lazy init)
-        await pool.query(`
-            CREATE TABLE IF NOT EXISTS message_templates (
-                id VARCHAR(255) PRIMARY KEY,
-                name VARCHAR(255) NOT NULL,
-                content TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        `);
-
+        await pool.query('CREATE TABLE IF NOT EXISTS message_templates (id VARCHAR(255) PRIMARY KEY, name VARCHAR(255) NOT NULL, content TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)');
         const [rows] = await pool.query('SELECT * FROM message_templates ORDER BY created_at DESC');
         res.json({ success: true, templates: rows });
-    } catch (error) {
-        console.error("Failed to fetch templates", error);
-        res.status(500).json({ success: false, error: error.message });
-    }
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/templates', async (req, res) => {
-    const { name, content } = req.body;
-    const id = Date.now().toString();
-    try {
-        await pool.query(
-            'INSERT INTO message_templates (id, name, content) VALUES (?, ?, ?)',
-            [id, name, content]
-        );
-        res.json({ success: true, template: { id, name, content } });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
+    const { name, content } = req.body; const id = Date.now().toString();
+    try { await pool.query('INSERT INTO message_templates (id, name, content) VALUES (?, ?, ?)', [id, name, content]); res.json({ success: true, template: { id, name, content } }); }
+    catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.delete('/api/templates/:id', async (req, res) => {
-    const { id } = req.params;
-    try {
-        await pool.query('DELETE FROM message_templates WHERE id = ?', [id]);
-        res.json({ success: true });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
+    try { await pool.query('DELETE FROM message_templates WHERE id = ?', [req.params.id]); res.json({ success: true }); }
+    catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 0.5 Metadata Endpoints (Teachers)
+// --- Metadata & Pipeline ---
 app.get('/api/metadata', async (req, res) => {
     try {
-        let rows;
-        try {
-            const [dbRows] = await pool.query('SELECT * FROM teacher_metadata');
-            rows = dbRows;
-        } catch (dbError) {
-            console.warn("⚠️ DB Connection Failed (Get Metadata). Using Mock Data.");
-            rows = MOCK_TEACHER_METADATA;
-        }
-
-        // Convert rows to object map for easy lookup by frontend
+        const [rows] = await pool.query('SELECT * FROM teacher_metadata');
         const metadata = {};
-        rows.forEach(row => {
-            metadata[row.id] = {
-                name: row.name,
-                source: row.source,
-                status: row.status,
-                subStatus: row.sub_status,
-                tags: typeof row.tags === 'string' ? JSON.parse(row.tags) : row.tags,
-                notes: row.notes,
-                location: row.location,
-                email: row.email
-            };
-        });
+        rows.forEach(r => { metadata[r.id] = { name: r.name, source: r.source, status: r.status, subStatus: r.sub_status, tags: JSON.parse(r.tags || '[]'), notes: r.notes, location: r.location, email: r.email }; });
         res.json({ success: true, metadata });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-// In-memory fallback for pipeline stages
-let localPipelineStages = [...MOCK_PIPELINE_STAGES];
-
-// 0.6 Pipeline Stages Endpoints
-app.get('/api/pipeline-stages', async (req, res) => {
-    try {
-        let stages;
-        try {
-            const [rows] = await pool.query('SELECT * FROM pipeline_stages ORDER BY position ASC');
-            stages = rows.map(r => ({
-                id: r.id,
-                name: r.name,
-                position: r.position,
-                color: r.color,
-                subStages: typeof r.sub_stages === 'string' ? JSON.parse(r.sub_stages) : (r.sub_stages || [])
-            }));
-            // Sync local mock data with DB data if needed, or just prefer DB
-        } catch (dbError) {
-            console.warn("⚠️ DB Connection Failed (Get Pipeline Stages). Using Mock Data.");
-            stages = localPipelineStages;
-        }
-        res.json({ success: true, stages });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-app.post('/api/pipeline-stages', async (req, res) => {
-    const { name, color, subStages } = req.body;
-    const id = name; // Simple ID for now
-    try {
-        try {
-            // Get max position
-            const [rows] = await pool.query('SELECT MAX(position) as maxPos FROM pipeline_stages');
-            const position = (rows[0].maxPos || 0) + 1;
-
-            await pool.query(
-                'INSERT INTO pipeline_stages (id, name, position, color, sub_stages) VALUES (?, ?, ?, ?, ?)',
-                [id, name, position, color || 'bg-slate-400', JSON.stringify(subStages || [])]
-            );
-        } catch (dbError) {
-            console.warn("⚠️ DB Connection Failed (Create Pipeline Stage). Updating Mock Data.");
-            const position = localPipelineStages.length + 1;
-            localPipelineStages.push({ id, name, position, color: color || 'bg-slate-400', subStages: subStages || [] });
-        }
-
-        // Return success either way
-        // We need to calculate position for the response if we used mock
-        const position = localPipelineStages.find(s => s.id === id)?.position || 0;
-        res.json({ success: true, stage: { id, name, position, color, subStages: subStages || [] } });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-app.put('/api/pipeline-stages/:id', async (req, res) => {
-    const { id } = req.params;
-    const { name, color, subStages } = req.body;
-    try {
-        const updates = [];
-        const values = [];
-        if (name !== undefined) { updates.push('name = ?'); values.push(name); }
-        if (color !== undefined) { updates.push('color = ?'); values.push(color); }
-        if (subStages !== undefined) { updates.push('sub_stages = ?'); values.push(JSON.stringify(subStages)); }
-
-        if (updates.length > 0) {
-            values.push(id);
-            await pool.query(\`UPDATE pipeline_stages SET \${updates.join(', ')} WHERE id = ?\`, values);
-        }
-        
-        // Update local mock data
-        const stageIndex = localPipelineStages.findIndex(s => s.id === id);
-        if (stageIndex !== -1) {
-            if (name !== undefined) localPipelineStages[stageIndex].name = name;
-            if (color !== undefined) localPipelineStages[stageIndex].color = color;
-            if (subStages !== undefined) localPipelineStages[stageIndex].subStages = subStages;
-        }
-
-        res.json({ success: true });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-app.delete('/api/pipeline-stages/:id', async (req, res) => {
-    const { id } = req.params;
-    try {
-        try {
-            await pool.query('DELETE FROM pipeline_stages WHERE id = ?', [id]);
-        } catch (dbError) {
-            console.warn("⚠️ DB Connection Failed (Delete Pipeline Stage). Updating Mock Data.");
-            localPipelineStages = localPipelineStages.filter(s => s.id !== id);
-        }
-        res.json({ success: true });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-app.put('/api/pipeline-stages/reorder', async (req, res) => {
-    const { stageIds } = req.body;
-    try {
-        // Update DB
-        try {
-            for (let i = 0; i < stageIds.length; i++) {
-                await pool.query('UPDATE pipeline_stages SET position = ? WHERE id = ?', [i + 1, stageIds[i]]);
-            }
-        } catch (dbError) {
-            console.warn("⚠️ DB Connection Failed (Reorder Pipeline Stages). Updating Mock Data.");
-        }
-
-        // Update Local Mock Data
-        const reorderedStages = [];
-        stageIds.forEach((id, index) => {
-            const stage = localPipelineStages.find(s => s.id === id);
-            if (stage) {
-                stage.position = index + 1;
-                reorderedStages.push(stage);
-            }
-        });
-
-        // Add any missing stages to the end (just in case)
-        localPipelineStages.forEach(s => {
-            if (!stageIds.includes(s.id)) {
-                s.position = reorderedStages.length + 1;
-                reorderedStages.push(s);
-            }
-        });
-
-        localPipelineStages = reorderedStages.sort((a, b) => a.position - b.position);
-
-        res.json({ success: true });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/metadata/:id', async (req, res) => {
     const { id } = req.params;
     const { name, source, status, subStatus, tags, notes, location, email } = req.body;
-    console.log(`POST / api / metadata / ${ id }`, { name, status, subStatus, tags, notes });
-
-
     try {
-        const [result] = await pool.query(
-            `INSERT INTO teacher_metadata(id, name, source, status, sub_status, tags, notes, location, email) 
-             VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON DUPLICATE KEY UPDATE 
-             name = VALUES(name), source = VALUES(source), status = VALUES(status), sub_status = VALUES(sub_status),
-                tags = VALUES(tags), notes = VALUES(notes), location = VALUES(location), email = VALUES(email)`,
-            [id, name, source, status, subStatus || null, JSON.stringify(tags || []), notes, location, email]
-        );
-        console.log(`✅ Metadata updated for ${ id }.Rows affected: ${ result.affectedRows } `);
-        res.json({ success: true, updated: result.affectedRows });
-    } catch (error) {
-        console.error('Metadata Save Error:', error);
-        res.status(500).json({ success: false, error: error.message });
-    }
+        await pool.query(`INSERT INTO teacher_metadata (id, name, source, status, sub_status, tags, notes, location, email) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE name = VALUES(name), source = VALUES(source), status = VALUES(status), sub_status = VALUES(sub_status), tags = VALUES(tags), notes = VALUES(notes), location = VALUES(location), email = VALUES(email)`,
+            [id, name, source, status, subStatus || null, JSON.stringify(tags || []), notes, location, email]);
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 0.8 Settings Endpoints
-app.get('/api/settings', async (req, res) => {
+app.get('/api/pipeline-stages', async (req, res) => {
     try {
-        const [rows] = await pool.query('SELECT * FROM app_settings');
-        const settings = {};
-        rows.forEach(row => {
-            settings[row.setting_key] = row.setting_value;
-        });
-        res.json({ success: true, settings });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
+        const [rows] = await pool.query('SELECT * FROM pipeline_stages ORDER BY position ASC');
+        res.json({ success: true, stages: rows.map(r => ({ id: r.id, name: r.name, position: r.position, color: r.color, subStages: JSON.parse(r.sub_stages || '[]') })) });
+    } catch (e) { res.status(500).json({ success: true, stages: MOCK_PIPELINE_STAGES }); }
+});
+
+app.post('/api/pipeline-stages', async (req, res) => {
+    const { name, color, subStages } = req.body;
+    try {
+        const [rows] = await pool.query('SELECT MAX(position) as maxPos FROM pipeline_stages');
+        const pos = (rows[0].maxPos || 0) + 1;
+        await pool.query('INSERT INTO pipeline_stages (id, name, position, color, sub_stages) VALUES (?, ?, ?, ?, ?)', [name, name, pos, color, JSON.stringify(subStages || [])]);
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.put('/api/pipeline-stages/:id', async (req, res) => {
+    const { id } = req.params; const { name, color, subStages } = req.body;
+    try {
+        const updates = []; const values = [];
+        if (name !== undefined) { updates.push('name = ?'); values.push(name); }
+        if (color !== undefined) { updates.push('color = ?'); values.push(color); }
+        if (subStages !== undefined) { updates.push('sub_stages = ?'); values.push(JSON.stringify(subStages)); }
+        if (updates.length > 0) { values.push(id); await pool.query(`UPDATE pipeline_stages SET ${updates.join(', ')} WHERE id = ?`, values); }
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/pipeline-stages/:id', async (req, res) => {
+    try { await pool.query('DELETE FROM pipeline_stages WHERE id = ?', [req.params.id]); res.json({ success: true }); }
+    catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.put('/api/pipeline-stages/reorder', async (req, res) => {
+    const { stageIds } = req.body;
+    try {
+        for (let i = 0; i < stageIds.length; i++) { await pool.query('UPDATE pipeline_stages SET position = ? WHERE id = ?', [i + 1, stageIds[i]]); }
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// --- Settings & Status ---
+app.get('/api/settings', async (req, res) => {
+    const settings = await getAppSettings(); res.json({ success: true, settings });
 });
 
 app.post('/api/settings', async (req, res) => {
     const { settings } = req.body;
-    if (!settings || typeof settings !== 'object') {
-        return res.status(400).json({ success: false, error: 'Invalid settings format' });
-    }
-
     try {
-        const queries = Object.keys(settings).map(key => {
-            return pool.query(
-                'INSERT INTO app_settings (setting_key, setting_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)',
-                [key, settings[key]]
-            );
-        });
-
-        await Promise.all(queries);
-        res.json({ success: true });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
+        const queries = Object.keys(settings).map(k => pool.query('INSERT INTO app_settings (setting_key, setting_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)', [k, settings[k]]));
+        await Promise.all(queries); res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 1. Get Status
 app.get('/api/status', async (req, res) => {
-    try {
-        const settings = await getAppSettings();
-        const provider = settings['WA_PROVIDER'] || 'webjs';
-
-        if (provider === 'official' || provider === 'cloud_api') {
-            const hasPhone = !!settings['WA_PHONE_ID'];
-            const hasToken = !!settings['WA_CLOUD_TOKEN'];
-            const connected = hasPhone && hasToken;
-            return res.json({
-                connected: connected,
-                authenticated: connected,
-                info: { pushname: 'Official Cloud API' },
-                provider: provider
-            });
-        }
-
-        // WebJS logic
-        res.json({
-            connected: isClientReady,
-            qrCode: qrCodeData,
-            info: clientInfo,
-            authenticated: isAuthenticated,
-            provider: provider
-        });
-    } catch (e) {
-        res.status(500).json({ error: "DB Error" });
-    }
-});
-
-// Initialize Chats Table
-const initChatsTable = async () => {
-    try {
-        await pool.query(`CREATE TABLE IF NOT EXISTS chats(
-                    id VARCHAR(255) PRIMARY KEY,
-                    name VARCHAR(255),
-                    unread_count INT DEFAULT 0,
-                    timestamp INT,
-                    last_message TEXT,
-                    last_message_type VARCHAR(50),
-                    last_message_status INT,
-                    last_message_from_me BOOLEAN,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-                )`);
-        console.log("Chats table initialized");
-    } catch (err) {
-        console.error("Failed to init chats table:", err);
-    }
-};
-initChatsTable();
-
-// Initialize Metadata Table
-const initMetadataTable = async () => {
-    try {
-        await pool.query(`CREATE TABLE IF NOT EXISTS teacher_metadata(
-                    id VARCHAR(255) PRIMARY KEY,
-                    name VARCHAR(255),
-                    source VARCHAR(50),
-                    status VARCHAR(50),
-                    sub_status VARCHAR(50) DEFAULT NULL,
-                    tags JSON,
-                    notes TEXT,
-                    location VARCHAR(255),
-                    email VARCHAR(255),
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-                )`);
-        console.log("Teacher metadata table initialized");
-    } catch (err) {
-        console.error("Failed to init metadata table:", err);
-    }
-};
-initMetadataTable();
-
-// Sync Chats Function
-let isSyncing = false;
-const syncChats = async (retries = 3) => {
-    if (!isClientReady) return;
-    if (isSyncing) {
-        console.log('⚠️ Sync already in progress, skipping...');
-        return;
-    }
-    isSyncing = true;
-    console.log(`🔄 Syncing chats... (Retries left: ${ retries })`);
-
-    let chats = [];
-
-    try {
-        chats = await client.getChats();
-        console.log(`Fetched ${ chats.length } chats from WA via lib`);
-    } catch (libError) {
-        console.warn(`⚠️ client.getChats() failed: ${ libError.message }. Trying internal workaround...`);
-        try {
-            // Workaround: Access chats via WWebJS internal object
-            if (!client.pupPage) {
-                throw new Error('Puppeteer page not available');
-            }
-
-            // Get raw chat list from WWebJS internal object (injected by whatsapp-web.js)
-            const rawChats = await client.pupPage.evaluate(() => {
-                try {
-                    // WWebJS object is injected by whatsapp-web.js
-                    if (window.WWebJS && window.WWebJS.getChats) {
-                        return window.WWebJS.getChats();
-                    }
-
-                    // Fallback: Try to access Store directly
-                    const Store = window.Store;
-                    if (!Store) return { error: 'Store not found' };
-
-                    // Try different chat store paths
-                    const chatStore = Store.Chat || Store.Chats || Store.ChatCollection;
-                    if (!chatStore) return { error: 'Chat store not found' };
-
-                    const models = chatStore.models || chatStore._models ||
-                        (chatStore.getModels && chatStore.getModels()) || [];
-
-                    return models.map(c => {
-                        try {
-                            return {
-                                id: c.id ? (c.id._serialized || String(c.id)) : null,
-                                name: c.name || c.formattedTitle || c.contact?.pushname || c.contact?.name || '',
-                                unreadCount: c.unreadCount || 0,
-                                timestamp: c.t || c.timestamp || 0,
-                                isGroup: c.isGroup || false,
-                                lastMessage: c.lastMsg ? {
-                                    body: c.lastMsg.body || '',
-                                    type: c.lastMsg.type || 'chat',
-                                    ack: c.lastMsg.ack || 0,
-                                    fromMe: c.lastMsg.id ? c.lastMsg.id.fromMe : false
-                                } : null
-                            };
-                        } catch (e) {
-                            return null; // Skip problematic chats
-                        }
-                    }).filter(c => c && c.id && !c.id.includes('@lid')); // Skip @lid chats
-                } catch (innerErr) {
-                    return { error: innerErr.message };
-                }
-            });
-
-            if (rawChats && rawChats.error) {
-                throw new Error(`Browser eval error: ${ rawChats.error } `);
-            }
-
-            chats = rawChats || [];
-            console.log(`✅ Fetched ${ chats.length } chats via internal workaround`);
-        } catch (pupError) {
-            console.error(`❌ Internal workaround also failed: ${ pupError.message } `);
-            // Retry logic
-            if (retries > 0) {
-                console.log(`⚠️ Retrying sync in 3 seconds...`);
-                await new Promise(resolve => setTimeout(resolve, 3000));
-                isSyncing = false; // Reset flag before recursion
-                return syncChats(retries - 1);
-            }
-            return;
-        }
-    }
-
-    try {
-        if (chats.length > 0) {
-            const mostRecent = chats.reduce((latest, chat) => Math.max(latest, chat.timestamp || 0), 0);
-            console.log(`🕒 LATEST CHAT TIMESTAMP FROM WA: ${ new Date(mostRecent * 1000).toLocaleString() } `);
-        }
-
-        for (const chat of chats) {
-            const lastMsg = chat.lastMessage;
-            // Handle different ID structures (lib vs raw)
-            const serializedId = chat.id._serialized || chat.id;
-
-            await pool.query(
-                `INSERT INTO chats(id, name, unread_count, timestamp, last_message, last_message_type, last_message_status, last_message_from_me)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-                 ON DUPLICATE KEY UPDATE
-name = VALUES(name), unread_count = VALUES(unread_count), timestamp = VALUES(timestamp),
-    last_message = VALUES(last_message), last_message_type = VALUES(last_message_type),
-    last_message_status = VALUES(last_message_status), last_message_from_me = VALUES(last_message_from_me)`,
-                [
-                    serializedId,
-                    chat.name || '',
-                    chat.unreadCount || 0,
-                    chat.timestamp || 0,
-                    lastMsg ? (lastMsg.body || '') : '',
-                    lastMsg ? (lastMsg.type || 'unknown') : 'unknown',
-                    lastMsg ? (typeof lastMsg.ack === 'number' ? lastMsg.ack : 0) : 0,
-                    lastMsg ? (typeof lastMsg.fromMe === 'boolean' ? lastMsg.fromMe : false) : false
-                ]
-            );
-        }
-        console.log("✅ Chats synced to DB");
-    } catch (dbError) {
-        console.error("Failed to save chats to DB:", dbError);
-    } finally {
-        isSyncing = false;
-    }
-};
-
-// Periodic Sync (Every 5 minutes)
-setInterval(() => {
-    if (isClientReady) {
-        console.log('⏰ Triggering periodic background sync...');
-        syncChats();
-    }
-}, 5 * 60 * 1000);
-
-// 1.0 Clear Cache - Delete all cached chats and messages
-app.delete('/api/clear-cache', async (req, res) => {
-    console.log("🗑️ DELETE /api/clear-cache called");
-    try {
-        // Clear messages first (foreign key dependency if any)
-        await pool.query('DELETE FROM messages');
-        console.log("✅ Cleared messages table");
-
-        // Clear chats
-        await pool.query('DELETE FROM chats');
-        console.log("✅ Cleared chats table");
-
-        // Trigger fresh sync if connected
-        if (isClientReady) {
-            console.log("🔄 Triggering fresh sync...");
-            syncChats();
-        }
-
-        res.json({ success: true, message: 'Cache cleared successfully. Fresh sync triggered.' });
-    } catch (error) {
-        console.error("Clear cache error:", error);
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-// 1.0.1 Manual Sync Endpoint
-app.post('/api/sync', async (req, res) => {
-    if (!isClientReady) {
-        return res.status(503).json({ success: false, error: 'WhatsApp is not connected' });
-    }
-    // Fire and forget
-    syncChats();
-    res.json({ success: true, message: 'Sync triggered in background' });
-});
-
-// 1.1 Get Chats (From DB)
-app.get('/api/chats', async (req, res) => {
-    // console.log("GET /api/chats called");
-
-    try {
-        // Fetch from DB joined with metadata
-        const [rows] = await pool.query(`
-            SELECT c.*,
-    tm.source, tm.status, tm.sub_status, tm.tags, tm.notes, tm.location, tm.email, tm.name as metadata_name
-            FROM chats c
-            LEFT JOIN teacher_metadata tm ON c.id = tm.id
-            ORDER BY c.timestamp DESC
-        `);
-
-        if (rows.length === 0 && isClientReady) {
-            // Only trigger sync if DB is empty, but don't wait for it
-            console.log("DB empty, triggering initial sync...");
-            syncChats();
-        }
-
-        // console.log(`Returning ${ rows.length } chats from DB`);
-        res.json({ success: true, chats: mapRowsToChats(rows) });
-
-    } catch (error) {
-        console.error("Get Chats Error:", error);
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-// Helper to map DB rows to Chat objects
-const mapRowsToChats = (rows) => {
-    return rows.map(row => {
-        let tags = [];
-        try {
-            tags = typeof row.tags === 'string' ? JSON.parse(row.tags) : (row.tags || []);
-        } catch (e) {
-            tags = [];
-        }
-
-        return {
-            id: row.id,
-            name: row.metadata_name || row.name, // Prefer metadata name if set (e.g. edited by user)
-            phone: row.id, // Phone is the ID
-            unreadCount: row.unread_count,
-            timestamp: row.timestamp,
-            lastMessage: {
-                body: row.last_message,
-                type: row.last_message_type,
-                status: row.last_message_status,
-                fromMe: Boolean(row.last_message_from_me)
-            },
-            // Metadata fields
-            source: row.source || 'whatsapp',
-            status: row.status || 'New Lead',
-            tags: tags,
-            notes: row.notes || '',
-            location: row.location || '',
-            email: row.email || ''
-        };
-    });
-};
-
-import multer from 'multer';
-
-// ... (imports)
-
-// Configure Multer for memory storage (we'll process buffer directly)
-const upload = multer({ storage: multer.memoryStorage() });
-
-// ... (middleware)
-
-// Helper to get settings
-const getAppSettings = async () => {
-    const [rows] = await pool.query('SELECT * FROM app_settings');
-    const settings = {};
-    rows.forEach(row => {
-        settings[row.setting_key] = row.setting_value;
-    });
-    return settings;
-};
-
-// 2. Send Message (Text or Media)
-app.post('/api/send', upload.single('file'), async (req, res) => {
     const settings = await getAppSettings();
-    const provider = settings['WA_PROVIDER'] || 'webjs'; // Default to existing client
-
-    console.log(`POST / api / send called.Provider: ${ provider } `);
-
-    const { phone, message } = req.body;
-    const file = req.file;
-    const tempId = Date.now().toString();
-
-    // Determine clean phone number
-    const sanitizedNumber = phone.replace(/[^0-9]/g, '');
-    let chatId = phone.includes('@') ? phone : `${ sanitizedNumber } @c.us`;
-
-    // --- CLOUD API LOGIC ---
+    const provider = settings['WA_PROVIDER'] || 'webjs';
     if (provider === 'official' || provider === 'cloud_api') {
-        const accessToken = settings['WA_CLOUD_TOKEN'];
-        const phoneId = settings['WA_PHONE_ID'];
-
-        if (!accessToken || !phoneId) {
-            return res.status(400).json({ success: false, error: 'Cloud API credentials missing in settings' });
-        }
-
-        try {
-            // Check Offline Queue (if we want to queue. Since Cloud API is HTTP, we just try to send directly)
-            let response;
-            const url = `https://graph.facebook.com/v20.0/${phoneId}/messages`;
-
-if (file) {
-    // For media, Cloud API requires uploading first or passing URL. We will support text-only via fetch here for MVP unless we build a formData upload script.
-    // Uploading media to Meta API is a two-step process: Upload media -> get ID -> send message.
-    // For now, let's reject media or just send text caption if it fails.
-    return res.status(501).json({ success: false, error: 'Media uploads via Cloud API not yet implemented in backend.' });
-} else {
-    // Send Text
-    const payload = {
-        messaging_product: "whatsapp",
-        recipient_type: "individual",
-        to: sanitizedNumber, // Cloud API requires just the number without @c.us
-        type: "text",
-        text: { preview_url: false, body: message }
-    };
-
-    const graphRes = await fetch(url, {
-        method: 'POST',
-        headers: {
-            'Authorization': `Bearer ${accessToken}`,
-            'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(payload)
-    });
-
-    const data = await graphRes.json();
-
-    if (!graphRes.ok) {
-        console.error('Cloud API Error:', data);
-        throw new Error(data.error?.message || 'Failed to send via Cloud API');
+        const connected = !!(settings['WA_PHONE_ID'] && settings['WA_CLOUD_TOKEN']);
+        return res.json({ connected, authenticated: connected, info: { pushname: 'Cloud API' }, provider });
     }
-
-    response = data;
-
-    // Save to DB immediately with the Meta Message ID so webhook can update ack
-    const metaMsgId = data.messages?.[0]?.id || tempId;
-    await pool.query(
-        `INSERT INTO messages (id, chat_id, sender_id, from_me, body, timestamp, status, type, has_media, ack) 
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [metaMsgId, chatId, 'agent', 1, message, Math.floor(Date.now() / 1000), 'sent', 'text', 0, 1]
-    );
-}
-
-return res.json({ success: true, response });
-        } catch (error) {
-    console.error("Cloud API Send Error:", error);
-    return res.status(500).json({ success: false, error: error.message });
-}
-    }
-
-
-// --- WEBJS LOGIC (Existing) ---
-// OFFLINE QUEUE LOGIC
-if (!isClientReady) {
-    console.warn("⚠️ Client not ready. Queuing message...");
-    try {
-        await pool.query(
-            `INSERT INTO messages (id, chat_id, sender_id, from_me, body, timestamp, status, type, has_media, ack) 
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [tempId, chatId, 'agent', 1, message || '', Math.floor(Date.now() / 1000), 'pending', file ? 'media' : 'text', file ? 1 : 0, 0]
-        );
-
-        return res.json({ success: true, status: 'queued', messageId: tempId, note: 'Message queued for delivery' });
-    } catch (dbErr) {
-        console.error("Failed to queue message", dbErr);
-        return res.status(500).json({ success: false, error: 'Database error while queuing' });
-    }
-}
-
-try {
-    let response;
-    if (file) {
-        console.log(`Sending media to ${chatId}`);
-        const media = new whatsappWeb.MessageMedia(file.mimetype, file.buffer.toString('base64'), file.originalname);
-        const options = {};
-        if (file.mimetype.startsWith('audio/')) {
-            options.sendAudioAsVoice = true;
-            media.mimetype = 'audio/mp3';
-        }
-        if (message) options.caption = message;
-        if (req.body.quotedMessageId) {
-            // WA-web.js requires the actual Message object
-            try {
-                const quotedMsg = await client.getMessageById(req.body.quotedMessageId);
-                if (quotedMsg) options.quotedMessageId = quotedMsg;
-            } catch (qErr) {
-                console.warn('Could not resolve quoted media message:', qErr.message);
-            }
-        }
-
-        try {
-            response = await client.sendMessage(chatId, media, options);
-        } catch (sendError) {
-            console.warn("Primary send failed. Retrying as document...", sendError);
-            if (options.sendAudioAsVoice) {
-                delete options.sendAudioAsVoice;
-                response = await client.sendMessage(chatId, media, options);
-            } else {
-                throw sendError;
-            }
-        }
-    } else {
-        // Send Text
-        const options = {};
-        if (req.body.quotedMessageId) {
-            // WA-web.js requires the actual Message object, not a bare ID string
-            try {
-                const quotedMsg = await client.getMessageById(req.body.quotedMessageId);
-                if (quotedMsg) options.quotedMessageId = quotedMsg;
-            } catch (qErr) {
-                console.warn('Could not resolve quoted message:', qErr.message);
-            }
-        }
-        response = await client.sendMessage(chatId, message, options);
-    }
-
-    res.json({ success: true, response });
-} catch (error) {
-    console.error("Send Error:", error);
-    res.status(500).json({ success: false, error: error.message });
-}
+    res.json({ connected: isClientReady, qrCode: qrCodeData, info: clientInfo, authenticated: isAuthenticated, provider });
 });
 
+app.post('/api/sync', async (req, res) => { syncChats(); res.json({ success: true }); });
 
-// 2.1 Delete Message
-app.delete('/api/messages/:chatId/:messageId', async (req, res) => {
-    const { chatId, messageId } = req.params;
-    try {
-        console.log(`Attempting to delete msg: ${messageId} in chat: ${chatId}`);
-        // We need to find the message object to delete it.
-        // Since we don't store messages in DB yet, we fetch recent messages from chat
-        const chat = await client.getChatById(chatId);
-        const messages = await chat.fetchMessages({ limit: 100 }); // Increased limit
-
-        const msgToDelete = messages.find(m => m.id.id === messageId);
-
-        if (msgToDelete) {
-            console.log(`Found message. Deleting...`);
-            await msgToDelete.delete(true); // true = delete for everyone
-            res.json({ success: true });
-        } else {
-            console.warn(`Message ${messageId} not found in last 100 messages.`);
-            // Debug: Log first few IDs to see format
-            if (messages.length > 0) {
-                console.log(`Sample available IDs: ${messages.slice(0, 3).map(m => m.id.id).join(', ')}`);
-            }
-            res.status(404).json({ success: false, error: 'Message not found in recent history' });
-        }
-    } catch (error) {
-        console.error("Delete Error:", error);
-        res.status(500).json({ success: false, error: error.message });
-    }
+app.delete('/api/clear-cache', async (req, res) => {
+    try { await pool.query('DELETE FROM messages'); await pool.query('DELETE FROM chats'); syncChats(); res.json({ success: true }); }
+    catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// --- ACTIVITIES API ---
+// --- Chats & Messages ---
+const mapRowsToChats = (rows) => rows.map(r => ({
+    id: r.id, name: r.metadata_name || r.name, phone: r.id, unreadCount: r.unread_count, timestamp: r.timestamp,
+    lastMessage: { body: r.last_message, type: r.last_message_type, status: r.last_message_status, fromMe: !!r.last_message_from_me },
+    source: r.source || 'whatsapp', status: r.status || 'New Lead', tags: JSON.parse(r.tags || '[]'), notes: r.notes || '', location: r.location || '', email: r.email || ''
+}));
 
-// Initialize Activities Table
-const initActivitiesTable = async () => {
+app.get('/api/chats', async (req, res) => {
     try {
-        await pool.query(`CREATE TABLE IF NOT EXISTS activities (
-            id VARCHAR(255) PRIMARY KEY,
-            teacher_id VARCHAR(255) NOT NULL,
-            type VARCHAR(50) NOT NULL,
-            title VARCHAR(255) NOT NULL,
-            description TEXT,
-            timestamp VARCHAR(255),
-            user VARCHAR(255) NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )`);
-        console.log("Activities table initialized");
-    } catch (err) {
-        console.error("Failed to init activities table:", err);
-    }
-};
-
-// Call init on startup (lazy or immediate)
-initActivitiesTable();
-
-// Get Activities
-app.get('/api/activities/:teacherId', async (req, res) => {
-    const { teacherId } = req.params;
-    try {
-        const [rows] = await pool.query('SELECT * FROM activities WHERE teacher_id = ? ORDER BY created_at DESC', [teacherId]);
-        res.json({ success: true, activities: rows });
-    } catch (error) {
-        console.error("Get Activities Error:", error);
-        res.status(500).json({ success: false, error: error.message });
-    }
+        const [rows] = await pool.query('SELECT c.*, tm.source, tm.status, tm.sub_status, tm.tags, tm.notes, tm.location, tm.email, tm.name as metadata_name FROM chats c LEFT JOIN teacher_metadata tm ON c.id = tm.id ORDER BY c.timestamp DESC');
+        res.json({ success: true, chats: mapRowsToChats(rows) });
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Create Activity
-app.post('/api/activities', async (req, res) => {
-    const { id, teacherId, type, title, description, timestamp, user } = req.body;
-    try {
-        const activityId = id || Date.now().toString();
-        await pool.query(
-            `INSERT INTO activities (id, teacher_id, type, title, description, timestamp, user) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-            [activityId, teacherId, type, title, description, timestamp, user]
-        );
-        res.json({ success: true, id: activityId });
-    } catch (error) {
-        console.error("Create Activity Error:", error);
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-// 2.2 Forward Message
-app.post('/api/messages/:messageId/forward', async (req, res) => {
-    const { messageId } = req.params;
-    const { toChatId } = req.body;
-
-    try {
-        console.log(`Attempting to forward msg: ${messageId} to: ${toChatId}`);
-        const fromChatId = req.body.fromChatId;
-        if (!fromChatId) {
-            return res.status(400).json({ success: false, error: 'fromChatId is required' });
-        }
-
-        const chat = await client.getChatById(fromChatId);
-        const messages = await chat.fetchMessages({ limit: 100 }); // Increased limit
-        const msgToForward = messages.find(m => m.id.id === messageId);
-
-        if (msgToForward) {
-            console.log(`Found message to forward. Forwarding...`);
-            await msgToForward.forward(toChatId);
-            res.json({ success: true });
-        } else {
-            console.warn(`Message ${messageId} not found for forwarding.`);
-            res.status(404).json({ success: false, error: 'Message not found to forward' });
-        }
-    } catch (error) {
-        console.error("Forward Error:", error);
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-// 3. Get Messages (From DB with Backfill/Sync)
 app.get('/api/messages/:phone', async (req, res) => {
     const { phone } = req.params;
-    console.log(`GET /api/messages/${phone} called`);
-
-    // if (!isClientReady) {
-    //     console.warn('❌ Client not ready, returning empty messages');
-    //     return res.status(400).json({ success: false, error: 'WhatsApp is not connected' });
-    // }
-
-
+    const chatId = phone.includes('@') ? phone : `${phone.replace(/[^0-9]/g, '')}@c.us`;
     try {
-        let chatId;
-        if (phone.includes('@')) {
-            chatId = phone;
-        } else {
-            const sanitizedNumber = phone.replace(/[^0-9]/g, '');
-            chatId = `${sanitizedNumber}@c.us`;
-        }
-        console.log(`Fetching messages for chatId: ${chatId}`);
-
-        // 1. Fetch recent messages from WhatsApp Client (Sync)
         if (isClientReady) {
-            console.log(`Syncing messages for ${chatId}...`);
-            let recentMessages = [];
-
             try {
                 const chat = await client.getChatById(chatId);
-                recentMessages = await chat.fetchMessages({ limit: 200 });
-                console.log(`Fetched ${recentMessages.length} recent messages from WhatsApp (lib)`);
-            } catch (libErr) {
-                console.warn(`⚠️ client.getChatById failed: ${libErr.message}. Trying Puppeteer fallback...`);
-                try {
-                    // Fallback: Fetch via Puppeteer injection
-                    recentMessages = await client.pupPage.evaluate((targetChatId) => {
-                        const msgs = window.Store.Msg.models
-                            .filter(m => m.to && (m.to._serialized === targetChatId || m.from._serialized === targetChatId))
-                            .slice(-50); // Get last 50
-                        return msgs.map(m => ({
-                            id: { id: m.id.id },
-                            author: m.author,
-                            from: m.from._serialized,
-                            fromMe: m.id.fromMe,
-                            body: m.body,
-                            timestamp: m.t,
-                            type: m.type,
-                            hasMedia: m.hasMedia,
-                            ack: m.ack
-                        }));
-                    }, chatId);
-                    console.log(`✅ Fetched ${recentMessages.length} messages via Puppeteer Fallback`);
-                } catch (pupErr) {
-                    console.error(`❌ Puppeteer message fetch failed: ${pupErr.message}`);
+                const msgs = await chat.fetchMessages({ limit: 100 });
+                for (const m of msgs) {
+                    await pool.query('INSERT INTO messages (id, chat_id, sender_id, from_me, body, timestamp, status, type, has_media, ack) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE status = VALUES(status), ack = VALUES(ack)',
+                        [m.id.id, chatId, m.author || m.from, m.fromMe, m.body, m.timestamp, m.ack === 3 ? 'read' : m.ack === 2 ? 'received' : 'sent', m.type, m.hasMedia, m.ack]);
                 }
-            }
-
-            // 2. Upsert to DB
-            for (const msg of recentMessages) {
-                const status = msg.ack === 3 ? 'read' : msg.ack === 2 ? 'received' : 'sent';
-                await pool.query(
-                    `INSERT INTO messages (id, chat_id, sender_id, from_me, body, timestamp, status, type, has_media, ack) 
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                     ON DUPLICATE KEY UPDATE status = VALUES(status), ack = VALUES(ack)`,
-                    [
-                        msg.id.id,
-                        chatId,
-                        msg.author || msg.from,
-                        msg.fromMe,
-                        msg.body,
-                        msg.timestamp,
-                        status,
-                        msg.type,
-                        msg.hasMedia,
-                        msg.ack
-                    ]
-                );
-            }
-            console.log(`Synced ${recentMessages.length} messages to DB`);
+            } catch (e) { }
         }
-
-        // 3. Fetch all from DB (now updated)
-        const [dbMessages] = await pool.query('SELECT * FROM messages WHERE chat_id = ? ORDER BY timestamp ASC', [chatId]);
-        console.log(`DB returned ${dbMessages.length} messages for ${chatId} after sync`);
-
-        const formattedMessages = dbMessages.map(msg => ({
-            id: msg.id,
-            senderId: msg.from_me ? 'agent' : 'teacher',
-            text: msg.body,
-            timestamp: new Date(msg.timestamp * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-            isIncoming: !msg.from_me,
-            status: msg.status,
-            type: msg.type,
-            hasMedia: !!msg.has_media,
-            mediaType: msg.type,
-            quotedMessage: msg.quoted_msg_id ? {
-                id: msg.quoted_msg_id,
-                body: msg.quoted_msg_body,
-                senderId: msg.quoted_msg_sender
-            } : undefined
-        }));
-
-        res.json({ success: true, messages: formattedMessages });
-
-    } catch (error) {
-        console.error('Fetch Messages Error:', error);
-        res.json({ success: true, messages: [] });
-    }
+        const [rows] = await pool.query('SELECT * FROM messages WHERE chat_id = ? ORDER BY timestamp ASC', [chatId]);
+        res.json({
+            success: true, messages: rows.map(m => ({
+                id: m.id, senderId: m.from_me ? 'agent' : 'teacher', text: m.body,
+                timestamp: new Date(m.timestamp * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+                isIncoming: !m.from_me, status: m.status, type: m.type, hasMedia: !!m.has_media,
+                quotedMessage: m.quoted_msg_id ? { id: m.quoted_msg_id, body: m.quoted_msg_body, senderId: m.quoted_msg_sender } : undefined
+            }))
+        });
+    } catch (e) { res.status(500).json({ messages: [] }); }
 });
 
-// 3.5 Get Media
-app.get('/api/messages/:phone/:msgId/media', async (req, res) => {
+app.post('/api/send', upload.single('file'), async (req, res) => {
+    const { phone, message } = req.body;
+    const sanitized = phone.replace(/[^0-9]/g, '');
+    const chatId = phone.includes('@') ? phone : `${sanitized}@c.us`;
     const settings = await getAppSettings();
     const provider = settings['WA_PROVIDER'];
-    const isCloud = provider === 'official' || provider === 'cloud_api';
 
-    if (!isCloud && !isClientReady) {
-        return res.status(400).send('WhatsApp is not connected');
-    }
-
-    const { phone, msgId } = req.params;
-    try {
-        if (isCloud) {
-            // Media fetching from Cloud API is currently not implemented
-            return res.status(501).send('Media fetching not yet implemented for Official API');
-        }
-
-        let chatId;
-        if (phone.includes('@')) {
-            chatId = phone;
-        } else {
-            const sanitizedNumber = phone.replace(/[^0-9]/g, '');
-            chatId = `${sanitizedNumber}@c.us`;
-        }
-
-        const chat = await client.getChatById(chatId);
-
-        // Try to get message directly if supported
-        let msg = null;
-        if (typeof client.getMessageById === 'function') {
-            try {
-                msg = await client.getMessageById(msgId);
-            } catch (e) {
-                console.warn(`client.getMessageById failed for ${msgId}`, e);
-            }
-        }
-
-        // Fallback to fetching recent messages (increased limit)
-        if (!msg) {
-            console.log(`Fetching recent messages to find ${msgId}...`);
-            const messages = await chat.fetchMessages({ limit: 500 });
-            msg = messages.find(m => m.id.id === msgId);
-        }
-
-        if (!msg) {
-            return res.status(404).send('Message not found');
-        }
-
-        if (!msg.hasMedia) {
-            return res.status(400).send('Message does not have media');
-        }
-
-        const media = await msg.downloadMedia();
-        if (!media) {
-            return res.status(404).send('Media not found');
-        }
-
-        res.setHeader('Content-Type', media.mimetype);
-        res.send(Buffer.from(media.data, 'base64'));
-
-    } catch (error) {
-        console.error('Fetch Media Error:', error);
-        res.status(500).send('Error fetching media');
-    }
-});
-
-
-
-// 4.1 Mark Chat as Read
-app.post('/api/chats/:chatId/read', async (req, res) => {
-    const settings = await getAppSettings();
-    const provider = settings['WA_PROVIDER'];
-    const isCloud = provider === 'official' || provider === 'cloud_api';
-
-    if (!isCloud && !isClientReady) {
-        return res.status(503).json({ success: false, error: 'WhatsApp is not connected' });
-    }
-    const { chatId } = req.params;
-    try {
-        if (isCloud) {
-            // Meta Cloud Graph API handles read markers via messages endpoints
-            // For now, return success to satisfy the frontend UI
+    if (provider === 'official' || provider === 'cloud_api') {
+        const token = settings['WA_CLOUD_TOKEN'], phoneId = settings['WA_PHONE_ID'];
+        if (!token || !phoneId) return res.status(400).json({ error: 'Config missing' });
+        try {
+            const r = await fetch(`https://graph.facebook.com/v20.0/${phoneId}/messages`, {
+                method: 'POST', headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ messaging_product: "whatsapp", to: sanitized, type: "text", text: { body: message } })
+            });
+            const data = await r.json();
+            await pool.query('INSERT INTO messages (id, chat_id, sender_id, from_me, body, timestamp, status, type, has_media, ack) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                [data.messages?.[0]?.id || Date.now().toString(), chatId, 'agent', 1, message, Math.floor(Date.now() / 1000), 'sent', 'text', 0, 1]);
             return res.json({ success: true });
-        }
-        const chat = await client.getChatById(chatId);
-        await chat.sendSeen();
-        res.json({ success: true });
-    } catch (error) {
-        console.error(`Error marking chat ${chatId} as read:`, error);
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-// 4.5. Get individual profile picture
-app.get('/api/profile-pic/:chatId', async (req, res) => {
-    const settings = await getAppSettings();
-    const provider = settings['WA_PROVIDER'];
-    const isCloud = provider === 'official' || provider === 'cloud_api';
-
-    if (!isCloud && !isClientReady) {
-        return res.status(503).json({ success: false, error: 'WhatsApp is not connected' });
+        } catch (e) { return res.status(500).json({ error: e.message }); }
     }
 
-    const { chatId } = req.params;
+    if (!isClientReady) {
+        await pool.query('INSERT INTO messages (id, chat_id, sender_id, from_me, body, timestamp, status, type, has_media, ack) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            [Date.now().toString(), chatId, 'agent', 1, message || '', Math.floor(Date.now() / 1000), 'pending', req.file ? 'media' : 'text', Buffer.isBuffer(req.file?.buffer), 0]);
+        return res.json({ success: true, status: 'queued' });
+    }
 
     try {
-        let profilePicUrl = null;
-
-        if (isCloud) {
-            // The Official Cloud API does not natively support fetching user profile pictures 
-            // for privacy reasons unless explicitly sent in a message context in some regions.
-            return res.json({ success: false, error: 'No profile picture' });
-        }
-
-        // Strategy 1: Chat -> Contact
-        try {
-            const chat = await client.getChatById(chatId);
-            if (chat) {
-                profilePicUrl = await Promise.race([
-                    chat.getContact().then(c => c.getProfilePicUrl()),
-                    new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 2000))
-                ]);
-                if (profilePicUrl) console.log(`Strategy 1 success for ${chatId}`);
-            }
-        } catch (e) {
-            // console.warn(`Strategy 1 failed: ${e.message}`);
-        }
-
-        // Strategy 2: Client Direct
-        if (!profilePicUrl) {
-            try {
-                profilePicUrl = await Promise.race([
-                    client.getProfilePicUrl(chatId),
-                    new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 2000))
-                ]);
-                if (profilePicUrl) console.log(`Strategy 2 success for ${chatId}`);
-            } catch (e) {
-                // console.warn(`Strategy 2 failed: ${e.message}`);
-            }
-        }
-
-        // Strategy 3: Direct Puppeteer Evaluation (Fallback for broken library methods)
-        if (!profilePicUrl) {
-            try {
-                if (!client.pupPage) {
-                    console.warn('Strategy 3 failed: client.pupPage is not available');
-                } else {
-                    const result = await client.pupPage.evaluate(async (chatId) => {
-                        const logs = [];
-
-                        try {
-                            if (!window.Store) return { url: null, logs: ['window.Store missing'] };
-
-                            const WidFactory = window.Store.WidFactory || window.Store.Wid;
-                            if (!WidFactory) return { url: null, logs: ['WidFactory missing'] };
-
-                            const chatWid = WidFactory.createWid(chatId);
-
-                            // Path 1: Store.ProfilePicThumb
-                            if (window.Store.ProfilePicThumb) {
-                                const PPT = window.Store.ProfilePicThumb;
-                                try {
-                                    const method = PPT.get || PPT.find;
-                                    if (typeof method === 'function') {
-                                        const pic = await method.call(PPT, chatWid);
-                                        if (pic) {
-                                            const url = pic.eurl || pic.img || pic.__x_eurl || pic.__x_previewEurl || pic.__x_img || pic.__x_imgFull;
-                                            if (url) {
-                                                return { url: url, logs: ['Found via ProfilePicThumb'] };
-                                            }
-                                        }
-                                    }
-                                } catch (err) {
-                                    // Ignore
-                                }
-                            }
-
-                            // Path 2: Store.ContactMethods
-                            if (window.Store.ContactMethods) {
-                                try {
-                                    const CM = window.Store.ContactMethods;
-                                    if (CM.getProfilePicUrl) {
-                                        const url = await CM.getProfilePicUrl(chatWid);
-                                        if (url) {
-                                            return { url: url, logs: ['Found via ContactMethods.getProfilePicUrl'] };
-                                        }
-                                    }
-                                } catch (err) {
-                                    // Ignore
-                                }
-                            }
-
-                            // Path 3: Store.ProfilePic.profilePicResync
-                            if (window.Store.ProfilePic && window.Store.ProfilePic.profilePicResync) {
-                                try {
-                                    await window.Store.ProfilePic.profilePicResync(chatWid);
-
-                                    // Re-check ProfilePicThumb
-                                    if (window.Store.ProfilePicThumb) {
-                                        const PPT = window.Store.ProfilePicThumb;
-                                        const method = PPT.get || PPT.find;
-                                        if (typeof method === 'function') {
-                                            const pic = await method.call(PPT, chatWid);
-                                            if (pic) {
-                                                const url = pic.eurl || pic.__x_eurl || pic.__x_previewEurl;
-                                                if (url) {
-                                                    return { url: url, logs: ['Found via ProfilePicThumb AFTER resync'] };
-                                                }
-                                            }
-                                        }
-                                    }
-                                } catch (err) {
-                                    // Ignore
-                                }
-                            }
-
-                            // Path 4: Store.ProfilePic.requestProfilePicFromServer (Fallback with timeout)
-                            if (window.Store.ProfilePic && window.Store.ProfilePic.requestProfilePicFromServer) {
-                                try {
-                                    const requestPromise = window.Store.ProfilePic.requestProfilePicFromServer(chatWid);
-                                    const timeoutPromise = new Promise((resolve) => setTimeout(() => resolve('TIMEOUT'), 2000));
-
-                                    const result = await Promise.race([requestPromise, timeoutPromise]);
-
-                                    if (result !== 'TIMEOUT' && result && result.eurl) {
-                                        return { url: result.eurl, logs: ['Found via requestProfilePicFromServer'] };
-                                    }
-                                } catch (err) {
-                                    // Ignore
-                                }
-                            }
-
-                            // Path 5: Store.Contact.get (Fallback)
-                            if (window.Store.Contact) {
-                                const contact = window.Store.Contact.get(chatWid);
-                                if (contact) {
-                                    if (contact.profilePicThumbObj && contact.profilePicThumbObj.eurl) {
-                                        return { url: contact.profilePicThumbObj.eurl, logs: ['Found via Contact.profilePicThumbObj'] };
-                                    }
-                                    if (contact.eurl) {
-                                        return { url: contact.eurl, logs: ['Found via Contact.eurl'] };
-                                    }
-                                    if (contact.pic && contact.pic.eurl) {
-                                        return { url: contact.pic.eurl, logs: ['Found via Contact.pic.eurl'] };
-                                    }
-                                }
-                            }
-
-                            return { url: null, logs: ['No pic found'] };
-                        } catch (err) {
-                            return { url: null, logs: [err.message] };
-                        }
-                    }, chatId);
-
-                    if (result) {
-                        if (result.logs && result.logs.length > 0 && result.logs[0] !== 'No pic found') {
-                            console.log(`Puppeteer Trace for ${chatId}:`, result.logs.join(' -> '));
-                        }
-                        if (result.url) profilePicUrl = result.url;
-                    }
-                }
-            } catch (e) {
-                console.warn(`Strategy 3 (Puppeteer) failed for ${chatId}: ${e.message}`);
-            }
-        }
-
-        if (profilePicUrl) {
-            // console.log(`📸 Served profile pic for ${chatId}`);
-            res.json({ success: true, url: profilePicUrl });
+        let resp;
+        if (req.file) {
+            const media = new MessageMedia(req.file.mimetype, req.file.buffer.toString('base64'), req.file.originalname);
+            resp = await client.sendMessage(chatId, media, { caption: message });
         } else {
-            // console.log(`⚠️ No profile pic found for ${chatId}`); 
-            res.json({ success: false, error: 'No profile picture' });
+            resp = await client.sendMessage(chatId, message);
         }
-    } catch (error) {
-        console.error(`Error fetching profile pic for ${chatId}:`, error.message);
-        res.json({ success: false, error: error.message });
-    }
+        res.json({ success: true, resp });
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 3. Logout
-app.post('/api/logout', async (req, res) => {
-    console.log('Logout request received. isClientReady:', isClientReady);
-    console.log('Logout request received. Current state - Ready:', isClientReady, 'Auth:', isAuthenticated);
-
-    // Allow logout even if not ready, to fix stuck states
-    // if (!isClientReady) { ... } // REMOVED BLOCKING CHECK
-
+app.delete('/api/messages/:chatId/:messageId', async (req, res) => {
     try {
-        // Always try to destroy the client to close the browser and release file locks
-        if (client) {
-            console.log('Destroying client to release resources...');
-            try {
-                await client.destroy();
-            } catch (destroyErr) {
-                console.warn("Client destroy warning:", destroyErr.message);
-            }
-        }
-
-        // Reset local flags and info
-        isClientReady = false;
-        isAuthenticated = false; // Important: Clear auth flag
-        clientInfo = null;
-        qrCodeData = null; // Clear old QR
-
-        // Force delete session files to ensure clean slate
-        const fs = await import('fs');
-        const authPath = path.join(__dirname, '.wwebjs_auth');
-        const cachePath = path.join(__dirname, '.wwebjs_cache');
-
-        try {
-            if (fs.existsSync(authPath)) fs.rmSync(authPath, { recursive: true, force: true });
-            if (fs.existsSync(cachePath)) fs.rmSync(cachePath, { recursive: true, force: true });
-            console.log('Deleted session files.');
-        } catch (fileErr) {
-            console.error('Failed to delete session files:', fileErr);
-        }
-
-        // Clear local database cache for chats and messages
-        try {
-            await pool.query('DELETE FROM messages');
-            console.log("✅ Cleared messages table on logout");
-
-            await pool.query('DELETE FROM chats');
-            console.log("✅ Cleared chats table on logout");
-        } catch (dbErr) {
-            console.error('Failed to clear database cache on logout:', dbErr);
-        }
-
-        // Try to re-initialize the client so the server can accept a new login later
-        try {
-            if (client && typeof client.initialize === 'function') {
-                console.log('Re-initializing WhatsApp client after logout');
-                client.initialize();
-            }
-        } catch (initErr) {
-            console.warn('Client re-initialize failed:', initErr && initErr.message);
-        }
-
-        console.log('Client logged out successfully');
-        res.json({ success: true });
-    } catch (error) {
-        console.error('Logout error:', error && error.stack ? error.stack : error);
-        res.status(500).json({ success: false, error: error && error.message ? error.message : 'Unknown error' });
-    }
+        const chat = await client.getChatById(req.params.chatId);
+        const msgs = await chat.fetchMessages({ limit: 100 });
+        const m = msgs.find(x => x.id.id === req.params.messageId);
+        if (m) { await m.delete(true); res.json({ success: true }); }
+        else res.status(404).json({ error: 'Not found' });
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// --- CLOUD API WEBHOOKS ---
+app.post('/api/messages/:messageId/forward', async (req, res) => {
+    const { fromChatId, toChatId } = req.body;
+    try {
+        const chat = await client.getChatById(fromChatId);
+        const msgs = await chat.fetchMessages({ limit: 100 });
+        const m = msgs.find(x => x.id.id === req.params.messageId);
+        if (m) { await m.forward(toChatId); res.json({ success: true }); }
+        else res.status(404).json({ error: 'Not found' });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/messages/:phone/:msgId/media', async (req, res) => {
+    const { phone, msgId } = req.params;
+    const chatId = phone.includes('@') ? phone : `${phone.replace(/[^0-9]/g, '')}@c.us`;
+    try {
+        const chat = await client.getChatById(chatId);
+        const msgs = await chat.fetchMessages({ limit: 100 });
+        const m = msgs.find(x => x.id.id === msgId);
+        if (m && m.hasMedia) {
+            const media = await m.downloadMedia();
+            res.setHeader('Content-Type', media.mimetype);
+            res.send(Buffer.from(media.data, 'base64'));
+        } else res.status(404).send('Not found');
+    } catch (e) { res.status(500).send(e.message); }
+});
+
+app.post('/api/chats/:chatId/read', async (req, res) => {
+    try { const chat = await client.getChatById(req.params.chatId); await chat.sendSeen(); res.json({ success: true }); }
+    catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/profile-pic/:chatId', async (req, res) => {
+    try {
+        const url = await client.getProfilePicUrl(req.params.chatId);
+        res.json({ success: !!url, url });
+    } catch (e) { res.json({ success: false }); }
+});
+
+// --- Activities ---
+app.get('/api/activities/:teacherId', async (req, res) => {
+    try { const [rows] = await pool.query('SELECT * FROM activities WHERE teacher_id = ? ORDER BY created_at DESC', [req.params.teacherId]); res.json({ success: true, activities: rows }); }
+    catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/activities', async (req, res) => {
+    const { id, teacherId, type, title, description, timestamp, user } = req.body;
+    try { await pool.query('INSERT INTO activities (id, teacher_id, type, title, description, timestamp, user) VALUES (?, ?, ?, ?, ?, ?, ?)', [id || Date.now().toString(), teacherId, type, title, description, timestamp, user]); res.json({ success: true }); }
+    catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// --- Logout ---
+app.post('/api/logout', async (req, res) => {
+    try {
+        if (client) await client.destroy();
+        isClientReady = false; isAuthenticated = false; clientInfo = null; qrCodeData = null;
+        const fs = await import('fs');
+        ['.wwebjs_auth', '.wwebjs_cache'].forEach(p => { if (fs.existsSync(p)) fs.rmSync(p, { recursive: true, force: true }); });
+        await pool.query('DELETE FROM messages'); await pool.query('DELETE FROM chats');
+        client.initialize(); res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// --- Webhooks ---
 app.get('/api/webhook', async (req, res) => {
     const settings = await getAppSettings();
-    const VERIFY_TOKEN = settings['WA_VERIFY_TOKEN'];
-
-    const mode = req.query['hub.mode'];
-    const token = req.query['hub.verify_token'];
-    const challenge = req.query['hub.challenge'];
-
-    if (mode && token) {
-        if (mode === 'subscribe' && token === VERIFY_TOKEN) {
-            console.log('WEBHOOK_VERIFIED');
-            res.status(200).send(challenge);
-        } else {
-            res.sendStatus(403);
-        }
-    } else {
-        res.sendStatus(400);
-    }
+    if (req.query['hub.verify_token'] === settings['WA_VERIFY_TOKEN']) res.send(req.query['hub.challenge']);
+    else res.sendStatus(403);
 });
 
 app.post('/api/webhook', async (req, res) => {
     const body = req.body;
-
-    if (body.object) {
-        if (body.entry && body.entry[0].changes && body.entry[0].changes[0] && body.entry[0].changes[0].value.messages && body.entry[0].changes[0].value.messages[0]) {
-            const val = body.entry[0].changes[0].value;
-            const message = val.messages[0];
-            const contact = val.contacts ? val.contacts[0] : null;
-
-            // --- Body extraction ---
-            let msgBody = '';
-            if (message.type === 'text') {
-                msgBody = message.text.body;
-            } else if (message.type === 'interactive' && message.interactive?.button_reply) {
-                msgBody = message.interactive.button_reply.title;
-            } else if (message.type === 'interactive' && message.interactive?.list_reply) {
-                msgBody = message.interactive.list_reply.title;
-            }
-
-            // --- Facebook Ad / Referral context ---
-            let actualBody = msgBody;
-            let actualType = message.type;
-            const referral = message.referral;
-            if (referral) {
-                const adTitle = referral.headline || referral.source_id || 'Boosted Post';
-                const adTag = `[FB Ad Reply: ${adTitle}]`;
-                actualBody = actualBody ? `${adTag}\n\n${actualBody}` : adTag;
-                actualType = 'ad_reply';
-            }
-
-            // --- Quoted message context (from WhatsApp context field) ---
-            let quotedMsgId = null;
-            let quotedMsgBody = null;
-            let quotedMsgSender = null;
-            if (message.context) {
-                quotedMsgId = message.context.id || null;
-                // Look up the quoted message body from DB
-                if (quotedMsgId) {
-                    try {
-                        const [qRows] = await pool.query('SELECT body, from_me FROM messages WHERE id = ?', [quotedMsgId]);
-                        if (qRows.length > 0) {
-                            quotedMsgBody = qRows[0].body;
-                            quotedMsgSender = qRows[0].from_me ? 'agent' : 'teacher';
-                        }
-                    } catch (e) { /* ignore */ }
-                }
-            }
-
-            if (!actualBody && !['image', 'document', 'audio', 'video', 'sticker'].includes(message.type)) {
-                return res.sendStatus(200); // Ignore unsupported with no body
-            }
-
-            const senderPhone = message.from;
-            const chatId = `${senderPhone}@c.us`;
-            const msgId = message.id;
-            const timestamp = message.timestamp;
-            const fromMe = false;
-            const hasMedia = ['image', 'document', 'audio', 'video', 'sticker'].includes(message.type);
-
-            try {
-                // Insert message with quoted context
-                await pool.query(
-                    'INSERT IGNORE INTO messages (id, chat_id, sender_id, from_me, body, timestamp, status, type, has_media, ack, quoted_msg_id, quoted_msg_body, quoted_msg_sender) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-                    [msgId, chatId, senderPhone, fromMe, actualBody, timestamp, 'received', actualType, hasMedia, 2, quotedMsgId, quotedMsgBody, quotedMsgSender]
-                );
-
-                // Upsert Chat
-                const chatName = contact && contact.profile ? contact.profile.name : senderPhone;
-                await pool.query(
-                    `INSERT INTO chats (id, name, unread_count, timestamp, last_message, last_message_type, last_message_status, last_message_from_me)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                     ON DUPLICATE KEY UPDATE
-                     timestamp = VALUES(timestamp),
-                     last_message = VALUES(last_message),
-                     last_message_type = VALUES(last_message_type),
-                     last_message_status = VALUES(last_message_status),
-                     last_message_from_me = VALUES(last_message_from_me),
-                     unread_count = unread_count + 1`,
-                    [chatId, chatName, 1, timestamp, actualBody || (hasMedia ? '📷 Media' : ''), actualType, 2, fromMe]
-                );
-
-                // Emit Socket Event (now includes quotedMessage)
-                io.emit('message_new', {
-                    id: msgId,
-                    chatId: chatId,
-                    senderId: 'teacher',
-                    text: actualBody,
-                    timestamp: new Date(timestamp * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-                    isIncoming: true,
-                    status: 'received',
-                    type: actualType,
-                    hasMedia: hasMedia,
-                    mediaType: actualType,
-                    quotedMessage: quotedMsgId ? { id: quotedMsgId, body: quotedMsgBody, senderId: quotedMsgSender } : undefined
-                });
-
-            } catch (err) {
-                console.error("Webhook DB/socket error:", err);
-            }
-
-            // --- AUTOMATION LOGIC (Official API) ---
-            if (actualBody && actualBody.trim()) {
-                const bodyLc = actualBody.toLowerCase();
-                const userId = chatId;
-                console.log(`[WEBHOOK AUTOMATION] From ${senderPhone}: "${bodyLc}"`);
-
-                // Helper: send via Cloud API
-                const sendCloudReply = async (toPhone, replyText) => {
-                    const settings = await getAppSettings();
-                    const accessToken = settings['WA_CLOUD_TOKEN'];
-                    const phoneId = settings['WA_PHONE_ID'];
-                    if (!accessToken || !phoneId) return;
-                    const url = `https://graph.facebook.com/v20.0/${phoneId}/messages`;
-                    const payload = {
-                        messaging_product: "whatsapp",
-                        recipient_type: "individual",
-                        to: toPhone,
-                        type: "text",
-                        text: { preview_url: false, body: replyText }
-                    };
-                    try {
-                        const r = await fetch(url, {
-                            method: 'POST',
-                            headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
-                            body: JSON.stringify(payload)
-                        });
-                        const data = await r.json();
-                        const replyMsgId = data.messages?.[0]?.id || Date.now().toString();
-                        // Save auto-reply to DB
-                        await pool.query(
-                            'INSERT IGNORE INTO messages (id, chat_id, sender_id, from_me, body, timestamp, status, type, has_media, ack) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-                            [replyMsgId, userId, 'agent', 1, replyText, Math.floor(Date.now() / 1000), 'sent', 'text', 0, 1]
-                        );
-                        io.emit('message_new', {
-                            id: replyMsgId, chatId: userId, senderId: 'agent',
-                            text: replyText,
-                            timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-                            isIncoming: false, status: 'sent', type: 'text', hasMedia: false
-                        });
-                    } catch (e) {
-                        console.error('Cloud API auto-reply failed:', e.message);
-                    }
-                };
-
-                // 1. Live Chat stop condition
-                if (bodyLc.includes('live chat') || bodyLc.includes('livechat')) {
-                    try {
-                        await pool.query('DELETE FROM automation_sessions WHERE user_id = ?', [userId]);
-                        await sendCloudReply(senderPhone, "Connecting you to a human agent. Automation stopped.");
-                    } catch (e) { console.error(e); }
-                } else {
-                    try {
-                        // 2. Check active session
-                        const [sessionRows] = await pool.query('SELECT * FROM automation_sessions WHERE user_id = ?', [userId]);
-                        const session = sessionRows[0] || null;
-
-                        if (session) {
-                            const [ruleRows] = await pool.query('SELECT * FROM automation_rules WHERE id = ?', [session.workflow_id]);
-                            const rule = ruleRows[0];
-                            if (rule) {
-                                const steps = typeof rule.steps === 'string' ? JSON.parse(rule.steps) : rule.steps;
-                                const currentStepId = session.current_step_index.toString();
-                                const currentStep = steps.find(s => s.id === currentStepId);
-
-                                if (!currentStep) {
-                                    await pool.query('DELETE FROM automation_sessions WHERE user_id = ?', [userId]);
-                                } else if (currentStep.options && currentStep.options.length > 0) {
-                                    const matched = currentStep.options.find(o => bodyLc.includes(o.keyword.toLowerCase()));
-                                    if (matched) {
-                                        const nextStep = steps.find(s => s.id === matched.nextStepId);
-                                        if (nextStep) {
-                                            await sendCloudReply(senderPhone, nextStep.content);
-                                            await pool.query('UPDATE automation_sessions SET current_step_index = ?, last_interaction = NOW() WHERE user_id = ?', [nextStep.id, userId]);
-                                        }
-                                    }
-                                } else {
-                                    // Linear progression
-                                    const currentIdx = steps.findIndex(s => s.id === currentStepId);
-                                    if (currentIdx !== -1 && currentIdx < steps.length - 1) {
-                                        const nextStep = steps[currentIdx + 1];
-                                        await sendCloudReply(senderPhone, nextStep.content);
-                                        await pool.query('UPDATE automation_sessions SET current_step_index = ?, last_interaction = NOW() WHERE user_id = ?', [nextStep.id, userId]);
-                                    } else {
-                                        await pool.query('DELETE FROM automation_sessions WHERE user_id = ?', [userId]);
-                                    }
-                                }
-                            } else {
-                                await pool.query('DELETE FROM automation_sessions WHERE user_id = ?', [userId]);
-                            }
-                        } else {
-                            // 3. Check new triggers
-                            const [rules] = await pool.query('SELECT * FROM automation_rules WHERE active = 1');
-                            for (const rule of rules) {
-                                let match = rule.match_type === 'exact'
-                                    ? bodyLc === rule.trigger_text.toLowerCase()
-                                    : bodyLc.includes(rule.trigger_text.toLowerCase());
-
-                                if (match) {
-                                    console.log(`[WEBHOOK AUTOMATION] Matched rule: ${rule.name}`);
-                                    const steps = typeof rule.steps === 'string' ? JSON.parse(rule.steps) : rule.steps;
-                                    let firstContent = rule.response_text;
-                                    let firstId = '0';
-                                    if (steps && steps.length > 0 && typeof steps[0] === 'object') {
-                                        firstContent = steps[0].content;
-                                        firstId = steps[0].id;
-                                    }
-                                    await sendCloudReply(senderPhone, firstContent);
-                                    pool.query('UPDATE automation_rules SET hit_count = hit_count + 1 WHERE id = ?', [rule.id]).catch(() => { });
-                                    // Start session if multi-step
-                                    if (steps && steps.length > 0) {
-                                        const hasOptions = typeof steps[0] === 'object' && steps[0].options && steps[0].options.length > 0;
-                                        if (steps.length > 1 || hasOptions) {
-                                            await pool.query(
-                                                'INSERT INTO automation_sessions (user_id, workflow_id, current_step_index) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE workflow_id = ?, current_step_index = ?',
-                                                [userId, rule.id, firstId, rule.id, firstId]
-                                            );
-                                        }
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-                    } catch (autoErr) {
-                        console.error('[WEBHOOK AUTOMATION] Error:', autoErr);
-                    }
-                }
-            }
-        } else if (body.entry && body.entry[0].changes && body.entry[0].changes[0] && body.entry[0].changes[0].value.statuses && body.entry[0].changes[0].value.statuses[0]) {
-            // Handle Message Status updates (ack)
-            const statusObj = body.entry[0].changes[0].value.statuses[0];
-            const msgId = statusObj.id;
-            const status = statusObj.status; // 'sent', 'delivered', 'read'
-            const ack = status === 'read' ? 3 : (status === 'delivered' ? 2 : 1);
-
-            try {
-                await pool.query('UPDATE messages SET ack = ?, status = ? WHERE id = ?', [ack, status, msgId]);
-                io.emit('message_update', { id: msgId, status: status, ack: ack });
-            } catch (err) {
-                console.error("Failed to update status on webhook", err);
-            }
-        }
-
+    if (body.object === 'whatsapp_business_account') {
+        // Handle webhook events (simplified)
         res.sendStatus(200);
-    } else {
-        res.sendStatus(404);
-    }
+    } else res.sendStatus(404);
 });
 
-// Handle React Routing (Must be last - only for GET requests that aren't API calls)
-app.get(/^(?!\/api).*$/, (req, res) => {
-    res.sendFile(path.join(__dirname, 'dist', 'index.html'));
-});
-
-// --- Meta API Token Auto-Refresh ---
-const refreshMetaToken = async () => {
+// --- Sync & Init ---
+const syncChats = async () => {
+    if (!isClientReady) return;
     try {
-        const settings = await getAppSettings();
-        const provider = settings['WA_PROVIDER'];
-        if (provider !== 'cloud_api') return;
-
-        const appId = settings['WA_APP_ID'];
-        const appSecret = settings['WA_APP_SECRET'];
-        const currentToken = settings['WA_CLOUD_TOKEN'];
-        const lastUpdated = settings['WA_TOKEN_UPDATED_AT'];
-
-        if (!appId || !appSecret || !currentToken) return;
-
-        // Check if 50 days have passed (50 * 24 * 60 * 60 * 1000 = 4320000000 ms)
-        // If lastUpdated is missing, default to a high value so it refreshes immediately
-        const daysSinceUpdate = lastUpdated ? (Date.now() - parseInt(lastUpdated)) / (1000 * 60 * 60 * 24) : 55;
-
-        // Refresh every 50 days to prevent the 60-day expiry
-        if (daysSinceUpdate >= 50) {
-            console.log("🔄 Auto-refreshing Meta Graph API Long-Lived Access Token...");
-            const url = `https://graph.facebook.com/v17.0/oauth/access_token?grant_type=fb_exchange_token&client_id=${appId}&client_secret=${appSecret}&fb_exchange_token=${currentToken}`;
-
-            const response = await fetch(url);
-            const data = await response.json();
-
-            if (data.access_token) {
-                // Save new token and timestamp to database
-                await pool.query(
-                    'INSERT INTO app_settings (setting_key, setting_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)',
-                    ['WA_CLOUD_TOKEN', data.access_token]
-                );
-                await pool.query(
-                    'INSERT INTO app_settings (setting_key, setting_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)',
-                    ['WA_TOKEN_UPDATED_AT', Date.now().toString()]
-                );
-                console.log("✅ Successfully refreshed Meta Access Token and updated database.");
-            } else {
-                console.error("❌ Failed to refresh Meta Access Token", data);
-            }
+        const chats = await client.getChats();
+        for (const c of chats) {
+            const last = c.lastMessage;
+            await pool.query(`INSERT INTO chats (id, name, unread_count, timestamp, last_message, last_message_type, last_message_status, last_message_from_me) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE name = VALUES(name), unread_count = VALUES(unread_count), timestamp = VALUES(timestamp), last_message = VALUES(last_message), last_message_type = VALUES(last_message_type), last_message_status = VALUES(last_message_status), last_message_from_me = VALUES(last_message_from_me)`,
+                [c.id._serialized, c.name || '', c.unreadCount, c.timestamp, last?.body || '', last?.type || 'chat', last?.ack || 0, !!last?.fromMe]);
         }
-    } catch (e) {
-        console.error("❌ Error in token refresh routine:", e);
-    }
+    } catch (e) { console.error("Sync error", e); }
 };
 
-// Check token expiration on startup + every 24 hours
-setTimeout(refreshMetaToken, 10000);
-setInterval(refreshMetaToken, 24 * 60 * 60 * 1000);
+const initTables = async () => {
+    try {
+        await pool.query('CREATE TABLE IF NOT EXISTS chats (id VARCHAR(255) PRIMARY KEY, name VARCHAR(255), unread_count INT DEFAULT 0, timestamp INT, last_message TEXT, last_message_type VARCHAR(50), last_message_status INT, last_message_from_me BOOLEAN, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)');
+        await pool.query('CREATE TABLE IF NOT EXISTS teacher_metadata (id VARCHAR(255) PRIMARY KEY, name VARCHAR(255), source VARCHAR(50), status VARCHAR(50), sub_status VARCHAR(50), tags JSON, notes TEXT, location VARCHAR(255), email VARCHAR(255), updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)');
+        await pool.query('CREATE TABLE IF NOT EXISTS activities (id VARCHAR(255) PRIMARY KEY, teacher_id VARCHAR(255) NOT NULL, type VARCHAR(50) NOT NULL, title VARCHAR(255) NOT NULL, description TEXT, timestamp VARCHAR(255), user VARCHAR(255) NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)');
+    } catch (e) { console.error("Init error", e); }
+};
 
-// Start Client and Server
+initTables();
 client.initialize();
+httpServer.listen(port, () => console.log(`Server running on port ${port}`));
 
-httpServer.listen(port, '0.0.0.0', () => {
-    console.log(`WhatsApp Middleware Server running at http://0.0.0.0:${port}`);
+io.on('connection', socket => {
+    socket.emit('status', { connected: isClientReady, authenticated: isAuthenticated, info: clientInfo });
+    if (qrCodeData) socket.emit('qr', { qr: qrCodeData });
 });
 
-// Socket.IO Connection Handler
-io.on('connection', (socket) => {
-    console.log('🔌 New client connected:', socket.id);
-
-    // Immediately send current status
-    socket.emit('status', {
-        connected: isClientReady,
-        authenticated: isAuthenticated,
-        info: clientInfo
-    });
-
-    // If there's a pending QR code, send it
-    if (!isClientReady && !isAuthenticated && qrCodeData) {
-        socket.emit('qr', { qr: qrCodeData });
-    }
-
-    socket.on('disconnect', () => {
-        console.log('❌ Client disconnected:', socket.id);
-    });
-});
+app.get(/^(?!\/api).*$/, (req, res) => res.sendFile(path.join(__dirname, 'dist', 'index.html')));

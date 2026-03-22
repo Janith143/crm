@@ -3,7 +3,9 @@ import { io } from 'socket.io-client';
 // Initialize Socket.IO
 // Determine URL based on environment
 const isLocal = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
-const socketUrl = isLocal ? 'http://localhost:3001' : 'https://crm.panoralink.com';
+const socketUrl = isLocal
+    ? `http://localhost:${import.meta.env.VITE_PORT || 3001}`
+    : (import.meta.env.VITE_API_DOMAIN || 'https://crm.panoralink.com');
 
 export const socket = io(socketUrl, { secure: !isLocal });
 

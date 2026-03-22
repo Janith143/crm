@@ -1,7 +1,9 @@
 import { MOCK_PIPELINE_STAGES } from '../constants';
 
 // In Electron, we need to use full URLs, not relative paths
-const API_BASE = import.meta.env.DEV ? 'http://localhost:3001/api' : 'https://crm.panoralink.com/api';
+const API_BASE = import.meta.env.DEV
+    ? `http://localhost:${import.meta.env.VITE_PORT || 3001}/api`
+    : `${import.meta.env.VITE_API_DOMAIN || 'https://crm.panoralink.com'}/api`;
 
 export { API_BASE };
 
