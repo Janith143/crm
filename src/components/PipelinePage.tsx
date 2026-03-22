@@ -1,12 +1,13 @@
 import React, { type DragEvent, useState, useEffect } from 'react';
 import { type Teacher, type TeacherStatus, DEFAULT_STATUSES } from '../types';
 import { MoreHorizontal, Phone, MessageSquare, ArrowRight, Plus, X, Trash2, RotateCcw } from 'lucide-react';
-import { fetchPipelineStages, createPipelineStage, deletePipelineStage, reorderPipelineStages } from '../services/api';
+import { fetchPipelineStages, createPipelineStage, deletePipelineStage, reorderPipelineStages, updatePipelineStage } from '../services/api';
 import { usePipeline } from '../context/PipelineContext';
 
 interface PipelinePageProps {
   teachers: Teacher[];
   updateStatus: (id: string, status: TeacherStatus) => void;
+  onUpdateTeacher?: (id: string, updates: Partial<Teacher>) => void;
 }
 
 interface PipelineStage {
@@ -14,13 +15,17 @@ interface PipelineStage {
   name: string;
   position: number;
   color: string;
+  subStages?: { id: string; name: string }[];
 }
 
-const PipelinePage: React.FC<PipelinePageProps> = ({ teachers, updateStatus }) => {
+const PipelinePage: React.FC<PipelinePageProps> = ({ teachers, updateStatus, onUpdateTeacher }) => {
   const { refreshStages } = usePipeline();
   const [stages, setStages] = useState<PipelineStage[]>([]);
   const [isAddingStage, setIsAddingStage] = useState(false);
   const [newStageName, setNewStageName] = useState('');
+
+  const [addingSubStageTo, setAddingSubStageTo] = useState<string | null>(null);
+  const [newSubStageName, setNewSubStageName] = useState('');
 
   const loadStages = async () => {
     try {
@@ -56,6 +61,54 @@ const PipelinePage: React.FC<PipelinePageProps> = ({ teachers, updateStatus }) =
       loadStages();
     } catch (error) {
       console.error("Failed to delete stage", error);
+    }
+  };
+
+  const handleAddSubStage = async (stageId: string) => {
+    if (!newSubStageName.trim()) return;
+
+    const stage = stages.find(s => s.id === stageId);
+    if (!stage) return;
+
+    const subStages = [...(stage.subStages || [])];
+    const newSubStage = {
+      id: newSubStageName.toLowerCase().replace(/\s+/g, '-'),
+      name: newSubStageName
+    };
+
+    // Prevent duplicates
+    if (subStages.find(s => s.id === newSubStage.id)) return;
+
+    subStages.push(newSubStage);
+
+    try {
+      await updatePipelineStage(stageId, { ...stage, subStages });
+      setNewSubStageName('');
+      setAddingSubStageTo(null);
+      loadStages();
+    } catch (error) {
+      console.error("Failed to add sub-stage", error);
+    }
+  };
+
+  const handleDeleteSubStage = async (stageId: string, subStageId: string) => {
+    if (!confirm(`Are you sure you want to delete this sub-stage?`)) return;
+
+    const stage = stages.find(s => s.id === stageId);
+    if (!stage) return;
+
+    const subStages = (stage.subStages || []).filter(s => s.id !== subStageId);
+
+    try {
+      await updatePipelineStage(stageId, { ...stage, subStages });
+
+      // Update any teachers in this sub-stage to remove their subStatus
+      const teachersInSubStage = teachers.filter(t => t.status === stageId && t.subStatus === subStageId);
+      await Promise.all(teachersInSubStage.map(t => onUpdateTeacher?.(t.id, { subStatus: '' })));
+
+      loadStages();
+    } catch (error) {
+      console.error("Failed to delete sub-stage", error);
     }
   };
 
@@ -204,6 +257,14 @@ const PipelinePage: React.FC<PipelinePageProps> = ({ teachers, updateStatus }) =
                     <RotateCcw size={14} />
                   </button>
                   <button
+                    onClick={(e) => { e.stopPropagation(); setAddingSubStageTo(addingSubStageTo === stage.id ? null : stage.id); }}
+                    className="p-1 text-slate-400 hover:text-green-500 transition-opacity"
+                    title="Add Sub-stage"
+                    onMouseDown={(e) => e.stopPropagation()}
+                  >
+                    <Plus size={14} />
+                  </button>
+                  <button
                     onClick={(e) => { e.stopPropagation(); handleDeleteStage(stage.id); }}
                     className="p-1 text-slate-400 hover:text-red-500 transition-opacity"
                     title="Delete Stage"
@@ -213,6 +274,39 @@ const PipelinePage: React.FC<PipelinePageProps> = ({ teachers, updateStatus }) =
                   </button>
                 </div>
               </div>
+
+              {/* Sub-stages UI */}
+              {addingSubStageTo === stage.id && (
+                <div className="p-2 border-b border-slate-200 bg-white" onMouseDown={(e) => e.stopPropagation()}>
+                  <div className="flex items-center gap-1 text-xs">
+                    <input
+                      autoFocus
+                      type="text"
+                      value={newSubStageName}
+                      onChange={(e) => setNewSubStageName(e.target.value)}
+                      placeholder="New sub-stage..."
+                      className="flex-1 px-2 py-1 border border-slate-200 rounded"
+                      onKeyDown={(e) => e.key === 'Enter' && handleAddSubStage(stage.id)}
+                    />
+                    <button onClick={() => handleAddSubStage(stage.id)} className="p-1 text-green-600 bg-green-50 hover:bg-green-100 rounded">
+                      <Plus size={12} />
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {stage.subStages && stage.subStages.length > 0 && (
+                <div className="px-2 py-1 gap-1 flex flex-wrap bg-white border-b border-slate-100" onMouseDown={(e) => e.stopPropagation()}>
+                  {stage.subStages.map(sub => (
+                    <div key={sub.id} className="flex items-center gap-1 bg-slate-100 px-1.5 py-0.5 rounded text-[10px] text-slate-600 border border-slate-200 group/sub">
+                      {sub.name}
+                      <button onClick={() => handleDeleteSubStage(stage.id, sub.id)} className="opacity-0 group-hover/sub:opacity-100 text-slate-400 hover:text-red-500">
+                        <X size={10} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
 
               {/* Cards Container */}
               <div className="flex-1 overflow-y-auto p-2 space-y-2 cursor-default" onMouseDown={(e) => e.stopPropagation()}>
@@ -247,6 +341,21 @@ const PipelinePage: React.FC<PipelinePageProps> = ({ teachers, updateStatus }) =
                             {tag}
                           </span>
                         ))}
+                      </div>
+                    )}
+
+                    {stage.subStages && stage.subStages.length > 0 && (
+                      <div className="mb-2" onMouseDown={(e) => e.stopPropagation()}>
+                        <select
+                          value={teacher.subStatus || ''}
+                          onChange={(e) => onUpdateTeacher?.(teacher.id, { subStatus: e.target.value })}
+                          className="w-full text-xs p-1 bg-slate-50 border border-slate-200 rounded text-slate-700 outline-none"
+                        >
+                          <option value="">No sub-stage</option>
+                          {stage.subStages.map(sub => (
+                            <option key={sub.id} value={sub.id}>{sub.name}</option>
+                          ))}
+                        </select>
                       </div>
                     )}
 

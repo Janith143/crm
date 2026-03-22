@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS teacher_metadata (
     notes TEXT,
     location VARCHAR(255),
     email VARCHAR(255),
+    sub_status VARCHAR(50) DEFAULT NULL,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 );
 
@@ -51,7 +52,8 @@ CREATE TABLE IF NOT EXISTS pipeline_stages (
     id VARCHAR(50) PRIMARY KEY,
     name VARCHAR(50) NOT NULL,
     position INT NOT NULL,
-    color VARCHAR(20) DEFAULT 'bg-slate-400'
+    color VARCHAR(20) DEFAULT 'bg-slate-400',
+    sub_stages JSON DEFAULT NULL
 );
 
 CREATE TABLE IF NOT EXISTS users (

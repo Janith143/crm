@@ -3,6 +3,7 @@ import { type Teacher, type TeacherStatus, DEFAULT_STATUSES } from '../types';
 import { Users, Send, AlertCircle, Sparkles, CheckCircle, Folder, PlayCircle, UserCheck, UserX, BookX, Image as ImageIcon, X } from 'lucide-react';
 import { generateBroadcastTemplate } from '../services/geminiService';
 import { sendBroadcastMessage } from '../services/whatsappService';
+import { sendSMS } from '../services/smsService';
 import { usePipeline } from '../context/PipelineContext';
 
 interface BroadcastPageProps {
@@ -13,6 +14,8 @@ const BroadcastPage: React.FC<BroadcastPageProps> = ({ teachers }) => {
   const { stages } = usePipeline();
   const [step, setStep] = useState(1);
   const [selectedSegment, setSelectedSegment] = useState<string>('All');
+  const [selectedSubStage, setSelectedSubStage] = useState<string>('All');
+  const [broadcastChannel, setBroadcastChannel] = useState<'whatsapp' | 'sms'>('whatsapp');
   const [messageTemplates, setMessageTemplates] = useState<string[]>(['']);
   const [activeTemplateIndex, setActiveTemplateIndex] = useState(0);
   const [aiTopic, setAiTopic] = useState('');
@@ -29,12 +32,16 @@ const BroadcastPage: React.FC<BroadcastPageProps> = ({ teachers }) => {
   const [progress, setProgress] = useState<{ sent: number; total: number; status: string; nextBatchTime: Date | null } | null>(null);
 
   // Determine audience based on selected segment (pipeline stage or tag)
-  const getAudience = (segment: string) => {
+  const getAudience = (segment: string, subStage: string) => {
     if (segment === 'All') return teachers;
     // Check for pipeline stage
     const stage = stages.find(s => s.name === segment);
     if (stage) {
-      return teachers.filter(t => t.status === stage.name);
+      let filtered = teachers.filter(t => t.status === stage.name || t.status === stage.id);
+      if (subStage !== 'All') {
+        filtered = filtered.filter(t => t.subStatus === subStage);
+      }
+      return filtered;
     }
     // Tag based fallback
     if (segment === 'Attended Onboarding') return teachers.filter(t => t.tags.includes('Attended Onboarding'));
@@ -42,7 +49,7 @@ const BroadcastPage: React.FC<BroadcastPageProps> = ({ teachers }) => {
     return [];
   };
 
-  const audience = getAudience(selectedSegment);
+  const audience = getAudience(selectedSegment, selectedSubStage);
 
   // Build segments list dynamically from pipeline stages
   const segments = [
@@ -83,7 +90,34 @@ const BroadcastPage: React.FC<BroadcastPageProps> = ({ teachers }) => {
     // Extract phone numbers
     const recipients = audience.map(t => t.phone);
 
-    // Send via service (handles real API if configured, otherwise simulates)
+    if (broadcastChannel === 'sms') {
+      let successCount = 0;
+      let failedCount = 0;
+      for (let i = 0; i < recipients.length; i++) {
+        setProgress({ sent: i, total: recipients.length, status: `Sending SMS ${i + 1}/${recipients.length}`, nextBatchTime: null });
+        try {
+          // Add small delay to prevent rate limit
+          if (i > 0) await new Promise(resolve => setTimeout(resolve, 1000));
+
+          const phone = recipients[i];
+          const text = validTemplates[i % validTemplates.length].replace(/{{name}}/g, audience[i].name).replace(/{{phone}}/g, phone);
+          const response = await sendSMS(phone, text);
+          if (response && response.status === 'success') {
+            successCount++;
+          } else {
+            failedCount++;
+          }
+        } catch (err) {
+          failedCount++;
+        }
+      }
+      setIsSending(false);
+      setProgress(null);
+      setSendResult({ success: successCount, failed: failedCount });
+      return;
+    }
+
+    // WhatsApp Send via service
     const result = await sendBroadcastMessage(
       recipients,
       validTemplates,
@@ -151,11 +185,11 @@ const BroadcastPage: React.FC<BroadcastPageProps> = ({ teachers }) => {
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
               {segments.map((seg) => {
-                const count = getAudience(seg.name).length;
+                const count = getAudience(seg.name, 'All').length;
                 return (
                   <button
                     key={seg.name}
-                    onClick={() => setSelectedSegment(seg.name)}
+                    onClick={() => { setSelectedSegment(seg.name); setSelectedSubStage('All'); }}
                     className={`p-4 rounded-lg border text-left transition-all flex items-start gap-3 ${selectedSegment === seg.name ? 'border-green-500 bg-green-50 ring-1 ring-green-500' : 'border-slate-200 hover:bg-slate-50'}`}
                   >
                     <div className="mt-1">{seg.icon}</div>
@@ -168,10 +202,54 @@ const BroadcastPage: React.FC<BroadcastPageProps> = ({ teachers }) => {
               })}
             </div>
 
+            {selectedSegment !== 'All' && stages.find(s => s.name === selectedSegment)?.subStages && (
+              <div className="mb-6 p-4 border border-slate-200 rounded-lg bg-slate-50">
+                <label className="block text-sm font-medium text-slate-700 mb-2">Filter by Sub-stage (Optional)</label>
+                <select
+                  className="w-full text-sm p-2 border border-slate-200 rounded-lg outline-none focus:border-green-500"
+                  value={selectedSubStage}
+                  onChange={(e) => setSelectedSubStage(e.target.value)}
+                >
+                  <option value="All">All {selectedSegment} Contacts</option>
+                  {stages.find(s => s.name === selectedSegment)!.subStages!.map(sub => (
+                    <option key={sub.id} value={sub.id}>{sub.name}</option>
+                  ))}
+                </select>
+              </div>
+            )}
+
+            <div className="mb-6">
+              <label className="block text-sm font-medium text-slate-700 mb-2">Broadcast Channel</label>
+              <div className="flex gap-4">
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="radio"
+                    name="channel"
+                    value="whatsapp"
+                    checked={broadcastChannel === 'whatsapp'}
+                    onChange={() => setBroadcastChannel('whatsapp')}
+                    className="w-4 h-4 text-green-600 focus:ring-green-500"
+                  />
+                  <span className="text-sm font-medium text-slate-800">WhatsApp</span>
+                </label>
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="radio"
+                    name="channel"
+                    value="sms"
+                    checked={broadcastChannel === 'sms'}
+                    onChange={() => setBroadcastChannel('sms')}
+                    className="w-4 h-4 text-green-600 focus:ring-green-500"
+                  />
+                  <span className="text-sm font-medium text-slate-800">SMS (Notify.lk)</span>
+                </label>
+              </div>
+            </div>
+
             <div className="bg-blue-50 text-blue-700 p-4 rounded-lg flex items-start gap-3 text-sm">
               <Users size={18} className="mt-0.5" />
               <div>
-                You are targeting <strong>{audience.length}</strong> teachers in the <strong>{selectedSegment}</strong> folder.
+                You are targeting <strong>{audience.length}</strong> teachers via <strong>{broadcastChannel.toUpperCase()}</strong>.
               </div>
             </div>
 
@@ -278,56 +356,58 @@ const BroadcastPage: React.FC<BroadcastPageProps> = ({ teachers }) => {
                 </div>
 
                 {/* Photo Attachment */}
-                <div className="mb-4">
-                  <label className="block text-sm font-medium text-slate-700 mb-2">Photo Attachment (Optional)</label>
-                  {!attachments[activeTemplateIndex] ? (
-                    <div className="border-2 border-dashed border-slate-300 rounded-lg p-6 text-center hover:bg-slate-50 transition-colors">
-                      <input
-                        type="file"
-                        accept="image/*"
-                        id="broadcast-image-upload"
-                        className="hidden"
-                        onChange={(e) => {
-                          if (e.target.files && e.target.files[0]) {
-                            const newAttachments = [...attachments];
-                            newAttachments[activeTemplateIndex] = e.target.files[0];
-                            setAttachments(newAttachments);
-                          }
-                        }}
-                        disabled={isSending}
-                      />
-                      <label htmlFor="broadcast-image-upload" className="cursor-pointer flex flex-col items-center justify-center gap-2">
-                        <div className="w-10 h-10 bg-blue-50 text-blue-500 rounded-full flex items-center justify-center">
-                          <ImageIcon size={20} />
+                {broadcastChannel === 'whatsapp' && (
+                  <div className="mb-4">
+                    <label className="block text-sm font-medium text-slate-700 mb-2">Photo Attachment (Optional)</label>
+                    {!attachments[activeTemplateIndex] ? (
+                      <div className="border-2 border-dashed border-slate-300 rounded-lg p-6 text-center hover:bg-slate-50 transition-colors">
+                        <input
+                          type="file"
+                          accept="image/*"
+                          id="broadcast-image-upload"
+                          className="hidden"
+                          onChange={(e) => {
+                            if (e.target.files && e.target.files[0]) {
+                              const newAttachments = [...attachments];
+                              newAttachments[activeTemplateIndex] = e.target.files[0];
+                              setAttachments(newAttachments);
+                            }
+                          }}
+                          disabled={isSending}
+                        />
+                        <label htmlFor="broadcast-image-upload" className="cursor-pointer flex flex-col items-center justify-center gap-2">
+                          <div className="w-10 h-10 bg-blue-50 text-blue-500 rounded-full flex items-center justify-center">
+                            <ImageIcon size={20} />
+                          </div>
+                          <span className="text-sm font-medium text-slate-600">Click to upload an image for Variation {activeTemplateIndex + 1}</span>
+                          <span className="text-xs text-slate-400">JPG, PNG, GIF up to 5MB</span>
+                        </label>
+                      </div>
+                    ) : (
+                      <div className="flex items-center gap-4 bg-slate-50 border border-slate-200 rounded-lg p-3">
+                        <div className="w-12 h-12 bg-slate-200 rounded overflow-hidden flex-shrink-0">
+                          <img src={URL.createObjectURL(attachments[activeTemplateIndex]!)} alt="Attachment preview" className="w-full h-full object-cover" />
                         </div>
-                        <span className="text-sm font-medium text-slate-600">Click to upload an image for Variation {activeTemplateIndex + 1}</span>
-                        <span className="text-xs text-slate-400">JPG, PNG, GIF up to 5MB</span>
-                      </label>
-                    </div>
-                  ) : (
-                    <div className="flex items-center gap-4 bg-slate-50 border border-slate-200 rounded-lg p-3">
-                      <div className="w-12 h-12 bg-slate-200 rounded overflow-hidden flex-shrink-0">
-                        <img src={URL.createObjectURL(attachments[activeTemplateIndex]!)} alt="Attachment preview" className="w-full h-full object-cover" />
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-medium text-slate-800 truncate">{attachments[activeTemplateIndex]!.name}</p>
+                          <p className="text-xs text-slate-500">{(attachments[activeTemplateIndex]!.size / 1024 / 1024).toFixed(2)} MB</p>
+                        </div>
+                        <button
+                          onClick={() => {
+                            const newAttachments = [...attachments];
+                            newAttachments[activeTemplateIndex] = null;
+                            setAttachments(newAttachments);
+                          }}
+                          disabled={isSending}
+                          className="p-2 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors flex-shrink-0"
+                          title="Remove attachment"
+                        >
+                          <X size={18} />
+                        </button>
                       </div>
-                      <div className="flex-1 min-w-0">
-                        <p className="text-sm font-medium text-slate-800 truncate">{attachments[activeTemplateIndex]!.name}</p>
-                        <p className="text-xs text-slate-500">{(attachments[activeTemplateIndex]!.size / 1024 / 1024).toFixed(2)} MB</p>
-                      </div>
-                      <button
-                        onClick={() => {
-                          const newAttachments = [...attachments];
-                          newAttachments[activeTemplateIndex] = null;
-                          setAttachments(newAttachments);
-                        }}
-                        disabled={isSending}
-                        className="p-2 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors flex-shrink-0"
-                        title="Remove attachment"
-                      >
-                        <X size={18} />
-                      </button>
-                    </div>
-                  )}
-                </div>
+                    )}
+                  </div>
+                )}
               </div>
 
               {/* Preview */}
@@ -354,71 +434,73 @@ const BroadcastPage: React.FC<BroadcastPageProps> = ({ teachers }) => {
             </div>
 
             {/* Rate Limiting Options */}
-            <div className="mt-6 pt-6 border-t border-slate-200">
-              <h4 className="text-sm font-semibold text-slate-800 mb-4 flex items-center gap-2">
-                <AlertCircle size={16} className="text-amber-500" />
-                Anti-Ban Rate Limiting
-              </h4>
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-                <div>
-                  <label className="block text-sm font-medium text-slate-700 mb-2">Contacts per batch</label>
-                  <input
-                    type="number"
-                    min="1"
-                    value={batchSize}
-                    onChange={(e) => setBatchSize(parseInt(e.target.value) || 1)}
-                    disabled={isSending}
-                    className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:border-green-500 disabled:bg-slate-50 disabled:text-slate-500"
-                  />
-                  <p className="text-xs text-slate-500 mt-1">Messages to send at once.</p>
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-slate-700 mb-2">Delay between batches</label>
-                  <div className="flex gap-4">
-                    <div className="flex-1">
-                      <div className="relative">
-                        <input
-                          type="number"
-                          min="0"
-                          value={delayMinutes}
-                          onChange={(e) => setDelayMinutes(parseInt(e.target.value) || 0)}
-                          disabled={isSending}
-                          className="w-full pl-3 pr-10 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:border-green-500 disabled:bg-slate-50 disabled:text-slate-500"
-                        />
-                        <div className="absolute right-3 top-2 text-xs text-slate-400">min</div>
-                      </div>
-                    </div>
-                    <div className="flex-1">
-                      <div className="relative">
-                        <input
-                          type="number"
-                          min="0"
-                          max="59"
-                          value={delaySeconds}
-                          onChange={(e) => setDelaySeconds(parseInt(e.target.value) || 0)}
-                          disabled={isSending}
-                          className="w-full pl-3 pr-8 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:border-green-500 disabled:bg-slate-50 disabled:text-slate-500"
-                        />
-                        <div className="absolute right-2 top-2 text-xs text-slate-400">sec</div>
-                      </div>
-                    </div>
+            {broadcastChannel === 'whatsapp' && (
+              <div className="mt-6 pt-6 border-t border-slate-200">
+                <h4 className="text-sm font-semibold text-slate-800 mb-4 flex items-center gap-2">
+                  <AlertCircle size={16} className="text-amber-500" />
+                  Anti-Ban Rate Limiting
+                </h4>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                  <div>
+                    <label className="block text-sm font-medium text-slate-700 mb-2">Contacts per batch</label>
+                    <input
+                      type="number"
+                      min="1"
+                      value={batchSize}
+                      onChange={(e) => setBatchSize(parseInt(e.target.value) || 1)}
+                      disabled={isSending}
+                      className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:border-green-500 disabled:bg-slate-50 disabled:text-slate-500"
+                    />
+                    <p className="text-xs text-slate-500 mt-1">Messages to send at once.</p>
                   </div>
-                  <p className="text-xs text-slate-500 mt-1">Wait time before next batch.</p>
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-slate-700 mb-2">Message gap (seconds)</label>
-                  <input
-                    type="number"
-                    min="1"
-                    value={messageDelaySeconds}
-                    onChange={(e) => setMessageDelaySeconds(parseInt(e.target.value) || 1)}
-                    disabled={isSending}
-                    className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:border-green-500 disabled:bg-slate-50 disabled:text-slate-500"
-                  />
-                  <p className="text-xs text-slate-500 mt-1">Delay between individual messages.</p>
+                  <div>
+                    <label className="block text-sm font-medium text-slate-700 mb-2">Delay between batches</label>
+                    <div className="flex gap-4">
+                      <div className="flex-1">
+                        <div className="relative">
+                          <input
+                            type="number"
+                            min="0"
+                            value={delayMinutes}
+                            onChange={(e) => setDelayMinutes(parseInt(e.target.value) || 0)}
+                            disabled={isSending}
+                            className="w-full pl-3 pr-10 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:border-green-500 disabled:bg-slate-50 disabled:text-slate-500"
+                          />
+                          <div className="absolute right-3 top-2 text-xs text-slate-400">min</div>
+                        </div>
+                      </div>
+                      <div className="flex-1">
+                        <div className="relative">
+                          <input
+                            type="number"
+                            min="0"
+                            max="59"
+                            value={delaySeconds}
+                            onChange={(e) => setDelaySeconds(parseInt(e.target.value) || 0)}
+                            disabled={isSending}
+                            className="w-full pl-3 pr-8 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:border-green-500 disabled:bg-slate-50 disabled:text-slate-500"
+                          />
+                          <div className="absolute right-2 top-2 text-xs text-slate-400">sec</div>
+                        </div>
+                      </div>
+                    </div>
+                    <p className="text-xs text-slate-500 mt-1">Wait time before next batch.</p>
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-slate-700 mb-2">Message gap (seconds)</label>
+                    <input
+                      type="number"
+                      min="1"
+                      value={messageDelaySeconds}
+                      onChange={(e) => setMessageDelaySeconds(parseInt(e.target.value) || 1)}
+                      disabled={isSending}
+                      className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:border-green-500 disabled:bg-slate-50 disabled:text-slate-500"
+                    />
+                    <p className="text-xs text-slate-500 mt-1">Delay between individual messages.</p>
+                  </div>
                 </div>
               </div>
-            </div>
+            )}
 
             {/* Progress Display */}
             {isSending && progress && (
@@ -459,10 +541,12 @@ const BroadcastPage: React.FC<BroadcastPageProps> = ({ teachers }) => {
                 Back
               </button>
               <div className="flex items-center gap-4">
-                <div className="flex items-center gap-2 text-amber-600 bg-amber-50 px-3 py-1.5 rounded text-xs border border-amber-100">
-                  <AlertCircle size={14} />
-                  <span>Meta needs to approve new templates</span>
-                </div>
+                {broadcastChannel === 'whatsapp' && (
+                  <div className="flex items-center gap-2 text-amber-600 bg-amber-50 px-3 py-1.5 rounded text-xs border border-amber-100">
+                    <AlertCircle size={14} />
+                    <span>Meta needs to approve new templates</span>
+                  </div>
+                )}
                 <button
                   onClick={handleSendBroadcast}
                   disabled={!messageTemplates.some(t => t.trim() !== '') || isSending}

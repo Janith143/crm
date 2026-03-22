@@ -57,6 +57,7 @@ export interface Teacher {
   location: string;
   source: ContactSource;
   status: TeacherStatus;
+  subStatus?: string; // Add optional subStatus for pipeline sub-stages
   tags: string[];
   email?: string;
   avatarUrl: string;
@@ -132,4 +133,9 @@ export interface Template {
   id: string;
   name: string;
   content: string;
+}
+
+export interface PipelineSubStage {
+  id: string;
+  name: string;
 }

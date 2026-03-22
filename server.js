@@ -840,6 +840,7 @@ app.get('/api/metadata', async (req, res) => {
                 name: row.name,
                 source: row.source,
                 status: row.status,
+                subStatus: row.sub_status,
                 tags: typeof row.tags === 'string' ? JSON.parse(row.tags) : row.tags,
                 notes: row.notes,
                 location: row.location,
@@ -861,7 +862,13 @@ app.get('/api/pipeline-stages', async (req, res) => {
         let stages;
         try {
             const [rows] = await pool.query('SELECT * FROM pipeline_stages ORDER BY position ASC');
-            stages = rows;
+            stages = rows.map(r => ({
+                id: r.id,
+                name: r.name,
+                position: r.position,
+                color: r.color,
+                subStages: typeof r.sub_stages === 'string' ? JSON.parse(r.sub_stages) : (r.sub_stages || [])
+            }));
             // Sync local mock data with DB data if needed, or just prefer DB
         } catch (dbError) {
             console.warn("⚠️ DB Connection Failed (Get Pipeline Stages). Using Mock Data.");
@@ -874,7 +881,7 @@ app.get('/api/pipeline-stages', async (req, res) => {
 });
 
 app.post('/api/pipeline-stages', async (req, res) => {
-    const { name, color } = req.body;
+    const { name, color, subStages } = req.body;
     const id = name; // Simple ID for now
     try {
         try {
@@ -883,19 +890,48 @@ app.post('/api/pipeline-stages', async (req, res) => {
             const position = (rows[0].maxPos || 0) + 1;
 
             await pool.query(
-                'INSERT INTO pipeline_stages (id, name, position, color) VALUES (?, ?, ?, ?)',
-                [id, name, position, color || 'bg-slate-400']
+                'INSERT INTO pipeline_stages (id, name, position, color, sub_stages) VALUES (?, ?, ?, ?, ?)',
+                [id, name, position, color || 'bg-slate-400', JSON.stringify(subStages || [])]
             );
         } catch (dbError) {
             console.warn("⚠️ DB Connection Failed (Create Pipeline Stage). Updating Mock Data.");
             const position = localPipelineStages.length + 1;
-            localPipelineStages.push({ id, name, position, color: color || 'bg-slate-400' });
+            localPipelineStages.push({ id, name, position, color: color || 'bg-slate-400', subStages: subStages || [] });
         }
 
         // Return success either way
         // We need to calculate position for the response if we used mock
         const position = localPipelineStages.find(s => s.id === id)?.position || 0;
-        res.json({ success: true, stage: { id, name, position, color } });
+        res.json({ success: true, stage: { id, name, position, color, subStages: subStages || [] } });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.put('/api/pipeline-stages/:id', async (req, res) => {
+    const { id } = req.params;
+    const { name, color, subStages } = req.body;
+    try {
+        const updates = [];
+        const values = [];
+        if (name !== undefined) { updates.push('name = ?'); values.push(name); }
+        if (color !== undefined) { updates.push('color = ?'); values.push(color); }
+        if (subStages !== undefined) { updates.push('sub_stages = ?'); values.push(JSON.stringify(subStages)); }
+
+        if (updates.length > 0) {
+            values.push(id);
+            await pool.query(\`UPDATE pipeline_stages SET \${updates.join(', ')} WHERE id = ?\`, values);
+        }
+        
+        // Update local mock data
+        const stageIndex = localPipelineStages.findIndex(s => s.id === id);
+        if (stageIndex !== -1) {
+            if (name !== undefined) localPipelineStages[stageIndex].name = name;
+            if (color !== undefined) localPipelineStages[stageIndex].color = color;
+            if (subStages !== undefined) localPipelineStages[stageIndex].subStages = subStages;
+        }
+
+        res.json({ success: true });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
     }
@@ -956,20 +992,20 @@ app.put('/api/pipeline-stages/reorder', async (req, res) => {
 
 app.post('/api/metadata/:id', async (req, res) => {
     const { id } = req.params;
-    const { name, source, status, tags, notes, location, email } = req.body;
-    console.log(`POST /api/metadata/${id}`, { name, status, tags, notes });
+    const { name, source, status, subStatus, tags, notes, location, email } = req.body;
+    console.log(`POST / api / metadata / ${ id }`, { name, status, subStatus, tags, notes });
 
 
     try {
         const [result] = await pool.query(
-            `INSERT INTO teacher_metadata (id, name, source, status, tags, notes, location, email) 
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            `INSERT INTO teacher_metadata(id, name, source, status, sub_status, tags, notes, location, email) 
+             VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON DUPLICATE KEY UPDATE 
-             name = VALUES(name), source = VALUES(source), status = VALUES(status), 
-             tags = VALUES(tags), notes = VALUES(notes), location = VALUES(location), email = VALUES(email)`,
-            [id, name, source, status, JSON.stringify(tags || []), notes, location, email]
+             name = VALUES(name), source = VALUES(source), status = VALUES(status), sub_status = VALUES(sub_status),
+                tags = VALUES(tags), notes = VALUES(notes), location = VALUES(location), email = VALUES(email)`,
+            [id, name, source, status, subStatus || null, JSON.stringify(tags || []), notes, location, email]
         );
-        console.log(`✅ Metadata updated for ${id}. Rows affected: ${result.affectedRows}`);
+        console.log(`✅ Metadata updated for ${ id }.Rows affected: ${ result.affectedRows } `);
         res.json({ success: true, updated: result.affectedRows });
     } catch (error) {
         console.error('Metadata Save Error:', error);
@@ -1046,17 +1082,17 @@ app.get('/api/status', async (req, res) => {
 // Initialize Chats Table
 const initChatsTable = async () => {
     try {
-        await pool.query(`CREATE TABLE IF NOT EXISTS chats (
-            id VARCHAR(255) PRIMARY KEY,
-            name VARCHAR(255),
-            unread_count INT DEFAULT 0,
-            timestamp INT,
-            last_message TEXT,
-            last_message_type VARCHAR(50),
-            last_message_status INT,
-            last_message_from_me BOOLEAN,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-        )`);
+        await pool.query(`CREATE TABLE IF NOT EXISTS chats(
+                    id VARCHAR(255) PRIMARY KEY,
+                    name VARCHAR(255),
+                    unread_count INT DEFAULT 0,
+                    timestamp INT,
+                    last_message TEXT,
+                    last_message_type VARCHAR(50),
+                    last_message_status INT,
+                    last_message_from_me BOOLEAN,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                )`);
         console.log("Chats table initialized");
     } catch (err) {
         console.error("Failed to init chats table:", err);
@@ -1067,17 +1103,18 @@ initChatsTable();
 // Initialize Metadata Table
 const initMetadataTable = async () => {
     try {
-        await pool.query(`CREATE TABLE IF NOT EXISTS teacher_metadata (
-            id VARCHAR(255) PRIMARY KEY,
-            name VARCHAR(255),
-            source VARCHAR(50),
-            status VARCHAR(50),
-            tags JSON,
-            notes TEXT,
-            location VARCHAR(255),
-            email VARCHAR(255),
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-        )`);
+        await pool.query(`CREATE TABLE IF NOT EXISTS teacher_metadata(
+                    id VARCHAR(255) PRIMARY KEY,
+                    name VARCHAR(255),
+                    source VARCHAR(50),
+                    status VARCHAR(50),
+                    sub_status VARCHAR(50) DEFAULT NULL,
+                    tags JSON,
+                    notes TEXT,
+                    location VARCHAR(255),
+                    email VARCHAR(255),
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                )`);
         console.log("Teacher metadata table initialized");
     } catch (err) {
         console.error("Failed to init metadata table:", err);
@@ -1094,15 +1131,15 @@ const syncChats = async (retries = 3) => {
         return;
     }
     isSyncing = true;
-    console.log(`🔄 Syncing chats... (Retries left: ${retries})`);
+    console.log(`🔄 Syncing chats... (Retries left: ${ retries })`);
 
     let chats = [];
 
     try {
         chats = await client.getChats();
-        console.log(`Fetched ${chats.length} chats from WA via lib`);
+        console.log(`Fetched ${ chats.length } chats from WA via lib`);
     } catch (libError) {
-        console.warn(`⚠️ client.getChats() failed: ${libError.message}. Trying internal workaround...`);
+        console.warn(`⚠️ client.getChats() failed: ${ libError.message }. Trying internal workaround...`);
         try {
             // Workaround: Access chats via WWebJS internal object
             if (!client.pupPage) {
@@ -1153,13 +1190,13 @@ const syncChats = async (retries = 3) => {
             });
 
             if (rawChats && rawChats.error) {
-                throw new Error(`Browser eval error: ${rawChats.error}`);
+                throw new Error(`Browser eval error: ${ rawChats.error } `);
             }
 
             chats = rawChats || [];
-            console.log(`✅ Fetched ${chats.length} chats via internal workaround`);
+            console.log(`✅ Fetched ${ chats.length } chats via internal workaround`);
         } catch (pupError) {
-            console.error(`❌ Internal workaround also failed: ${pupError.message}`);
+            console.error(`❌ Internal workaround also failed: ${ pupError.message } `);
             // Retry logic
             if (retries > 0) {
                 console.log(`⚠️ Retrying sync in 3 seconds...`);
@@ -1174,7 +1211,7 @@ const syncChats = async (retries = 3) => {
     try {
         if (chats.length > 0) {
             const mostRecent = chats.reduce((latest, chat) => Math.max(latest, chat.timestamp || 0), 0);
-            console.log(`🕒 LATEST CHAT TIMESTAMP FROM WA: ${new Date(mostRecent * 1000).toLocaleString()}`);
+            console.log(`🕒 LATEST CHAT TIMESTAMP FROM WA: ${ new Date(mostRecent * 1000).toLocaleString() } `);
         }
 
         for (const chat of chats) {
@@ -1183,12 +1220,12 @@ const syncChats = async (retries = 3) => {
             const serializedId = chat.id._serialized || chat.id;
 
             await pool.query(
-                `INSERT INTO chats (id, name, unread_count, timestamp, last_message, last_message_type, last_message_status, last_message_from_me)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                `INSERT INTO chats(id, name, unread_count, timestamp, last_message, last_message_type, last_message_status, last_message_from_me)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?)
                  ON DUPLICATE KEY UPDATE
-                 name = VALUES(name), unread_count = VALUES(unread_count), timestamp = VALUES(timestamp),
-                 last_message = VALUES(last_message), last_message_type = VALUES(last_message_type),
-                 last_message_status = VALUES(last_message_status), last_message_from_me = VALUES(last_message_from_me)`,
+name = VALUES(name), unread_count = VALUES(unread_count), timestamp = VALUES(timestamp),
+    last_message = VALUES(last_message), last_message_type = VALUES(last_message_type),
+    last_message_status = VALUES(last_message_status), last_message_from_me = VALUES(last_message_from_me)`,
                 [
                     serializedId,
                     chat.name || '',
@@ -1259,8 +1296,8 @@ app.get('/api/chats', async (req, res) => {
     try {
         // Fetch from DB joined with metadata
         const [rows] = await pool.query(`
-            SELECT c.*, 
-                   tm.source, tm.status, tm.tags, tm.notes, tm.location, tm.email, tm.name as metadata_name
+            SELECT c.*,
+    tm.source, tm.status, tm.sub_status, tm.tags, tm.notes, tm.location, tm.email, tm.name as metadata_name
             FROM chats c
             LEFT JOIN teacher_metadata tm ON c.id = tm.id
             ORDER BY c.timestamp DESC
@@ -1272,7 +1309,7 @@ app.get('/api/chats', async (req, res) => {
             syncChats();
         }
 
-        // console.log(`Returning ${rows.length} chats from DB`);
+        // console.log(`Returning ${ rows.length } chats from DB`);
         res.json({ success: true, chats: mapRowsToChats(rows) });
 
     } catch (error) {
@@ -1338,7 +1375,7 @@ app.post('/api/send', upload.single('file'), async (req, res) => {
     const settings = await getAppSettings();
     const provider = settings['WA_PROVIDER'] || 'webjs'; // Default to existing client
 
-    console.log(`POST /api/send called. Provider: ${provider}`);
+    console.log(`POST / api / send called.Provider: ${ provider } `);
 
     const { phone, message } = req.body;
     const file = req.file;
@@ -1346,7 +1383,7 @@ app.post('/api/send', upload.single('file'), async (req, res) => {
 
     // Determine clean phone number
     const sanitizedNumber = phone.replace(/[^0-9]/g, '');
-    let chatId = phone.includes('@') ? phone : `${sanitizedNumber}@c.us`;
+    let chatId = phone.includes('@') ? phone : `${ sanitizedNumber } @c.us`;
 
     // --- CLOUD API LOGIC ---
     if (provider === 'official' || provider === 'cloud_api') {
@@ -1362,126 +1399,126 @@ app.post('/api/send', upload.single('file'), async (req, res) => {
             let response;
             const url = `https://graph.facebook.com/v20.0/${phoneId}/messages`;
 
-            if (file) {
-                // For media, Cloud API requires uploading first or passing URL. We will support text-only via fetch here for MVP unless we build a formData upload script.
-                // Uploading media to Meta API is a two-step process: Upload media -> get ID -> send message.
-                // For now, let's reject media or just send text caption if it fails.
-                return res.status(501).json({ success: false, error: 'Media uploads via Cloud API not yet implemented in backend.' });
-            } else {
-                // Send Text
-                const payload = {
-                    messaging_product: "whatsapp",
-                    recipient_type: "individual",
-                    to: sanitizedNumber, // Cloud API requires just the number without @c.us
-                    type: "text",
-                    text: { preview_url: false, body: message }
-                };
+if (file) {
+    // For media, Cloud API requires uploading first or passing URL. We will support text-only via fetch here for MVP unless we build a formData upload script.
+    // Uploading media to Meta API is a two-step process: Upload media -> get ID -> send message.
+    // For now, let's reject media or just send text caption if it fails.
+    return res.status(501).json({ success: false, error: 'Media uploads via Cloud API not yet implemented in backend.' });
+} else {
+    // Send Text
+    const payload = {
+        messaging_product: "whatsapp",
+        recipient_type: "individual",
+        to: sanitizedNumber, // Cloud API requires just the number without @c.us
+        type: "text",
+        text: { preview_url: false, body: message }
+    };
 
-                const graphRes = await fetch(url, {
-                    method: 'POST',
-                    headers: {
-                        'Authorization': `Bearer ${accessToken}`,
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify(payload)
-                });
+    const graphRes = await fetch(url, {
+        method: 'POST',
+        headers: {
+            'Authorization': `Bearer ${accessToken}`,
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(payload)
+    });
 
-                const data = await graphRes.json();
+    const data = await graphRes.json();
 
-                if (!graphRes.ok) {
-                    console.error('Cloud API Error:', data);
-                    throw new Error(data.error?.message || 'Failed to send via Cloud API');
-                }
+    if (!graphRes.ok) {
+        console.error('Cloud API Error:', data);
+        throw new Error(data.error?.message || 'Failed to send via Cloud API');
+    }
 
-                response = data;
+    response = data;
 
-                // Save to DB immediately with the Meta Message ID so webhook can update ack
-                const metaMsgId = data.messages?.[0]?.id || tempId;
-                await pool.query(
-                    `INSERT INTO messages (id, chat_id, sender_id, from_me, body, timestamp, status, type, has_media, ack) 
+    // Save to DB immediately with the Meta Message ID so webhook can update ack
+    const metaMsgId = data.messages?.[0]?.id || tempId;
+    await pool.query(
+        `INSERT INTO messages (id, chat_id, sender_id, from_me, body, timestamp, status, type, has_media, ack) 
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                    [metaMsgId, chatId, 'agent', 1, message, Math.floor(Date.now() / 1000), 'sent', 'text', 0, 1]
-                );
-            }
+        [metaMsgId, chatId, 'agent', 1, message, Math.floor(Date.now() / 1000), 'sent', 'text', 0, 1]
+    );
+}
 
-            return res.json({ success: true, response });
+return res.json({ success: true, response });
         } catch (error) {
-            console.error("Cloud API Send Error:", error);
-            return res.status(500).json({ success: false, error: error.message });
-        }
+    console.error("Cloud API Send Error:", error);
+    return res.status(500).json({ success: false, error: error.message });
+}
     }
 
 
-    // --- WEBJS LOGIC (Existing) ---
-    // OFFLINE QUEUE LOGIC
-    if (!isClientReady) {
-        console.warn("⚠️ Client not ready. Queuing message...");
-        try {
-            await pool.query(
-                `INSERT INTO messages (id, chat_id, sender_id, from_me, body, timestamp, status, type, has_media, ack) 
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                [tempId, chatId, 'agent', 1, message || '', Math.floor(Date.now() / 1000), 'pending', file ? 'media' : 'text', file ? 1 : 0, 0]
-            );
-
-            return res.json({ success: true, status: 'queued', messageId: tempId, note: 'Message queued for delivery' });
-        } catch (dbErr) {
-            console.error("Failed to queue message", dbErr);
-            return res.status(500).json({ success: false, error: 'Database error while queuing' });
-        }
-    }
-
+// --- WEBJS LOGIC (Existing) ---
+// OFFLINE QUEUE LOGIC
+if (!isClientReady) {
+    console.warn("⚠️ Client not ready. Queuing message...");
     try {
-        let response;
-        if (file) {
-            console.log(`Sending media to ${chatId}`);
-            const media = new whatsappWeb.MessageMedia(file.mimetype, file.buffer.toString('base64'), file.originalname);
-            const options = {};
-            if (file.mimetype.startsWith('audio/')) {
-                options.sendAudioAsVoice = true;
-                media.mimetype = 'audio/mp3';
-            }
-            if (message) options.caption = message;
-            if (req.body.quotedMessageId) {
-                // WA-web.js requires the actual Message object
-                try {
-                    const quotedMsg = await client.getMessageById(req.body.quotedMessageId);
-                    if (quotedMsg) options.quotedMessageId = quotedMsg;
-                } catch (qErr) {
-                    console.warn('Could not resolve quoted media message:', qErr.message);
-                }
-            }
+        await pool.query(
+            `INSERT INTO messages (id, chat_id, sender_id, from_me, body, timestamp, status, type, has_media, ack) 
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [tempId, chatId, 'agent', 1, message || '', Math.floor(Date.now() / 1000), 'pending', file ? 'media' : 'text', file ? 1 : 0, 0]
+        );
 
+        return res.json({ success: true, status: 'queued', messageId: tempId, note: 'Message queued for delivery' });
+    } catch (dbErr) {
+        console.error("Failed to queue message", dbErr);
+        return res.status(500).json({ success: false, error: 'Database error while queuing' });
+    }
+}
+
+try {
+    let response;
+    if (file) {
+        console.log(`Sending media to ${chatId}`);
+        const media = new whatsappWeb.MessageMedia(file.mimetype, file.buffer.toString('base64'), file.originalname);
+        const options = {};
+        if (file.mimetype.startsWith('audio/')) {
+            options.sendAudioAsVoice = true;
+            media.mimetype = 'audio/mp3';
+        }
+        if (message) options.caption = message;
+        if (req.body.quotedMessageId) {
+            // WA-web.js requires the actual Message object
             try {
-                response = await client.sendMessage(chatId, media, options);
-            } catch (sendError) {
-                console.warn("Primary send failed. Retrying as document...", sendError);
-                if (options.sendAudioAsVoice) {
-                    delete options.sendAudioAsVoice;
-                    response = await client.sendMessage(chatId, media, options);
-                } else {
-                    throw sendError;
-                }
+                const quotedMsg = await client.getMessageById(req.body.quotedMessageId);
+                if (quotedMsg) options.quotedMessageId = quotedMsg;
+            } catch (qErr) {
+                console.warn('Could not resolve quoted media message:', qErr.message);
             }
-        } else {
-            // Send Text
-            const options = {};
-            if (req.body.quotedMessageId) {
-                // WA-web.js requires the actual Message object, not a bare ID string
-                try {
-                    const quotedMsg = await client.getMessageById(req.body.quotedMessageId);
-                    if (quotedMsg) options.quotedMessageId = quotedMsg;
-                } catch (qErr) {
-                    console.warn('Could not resolve quoted message:', qErr.message);
-                }
-            }
-            response = await client.sendMessage(chatId, message, options);
         }
 
-        res.json({ success: true, response });
-    } catch (error) {
-        console.error("Send Error:", error);
-        res.status(500).json({ success: false, error: error.message });
+        try {
+            response = await client.sendMessage(chatId, media, options);
+        } catch (sendError) {
+            console.warn("Primary send failed. Retrying as document...", sendError);
+            if (options.sendAudioAsVoice) {
+                delete options.sendAudioAsVoice;
+                response = await client.sendMessage(chatId, media, options);
+            } else {
+                throw sendError;
+            }
+        }
+    } else {
+        // Send Text
+        const options = {};
+        if (req.body.quotedMessageId) {
+            // WA-web.js requires the actual Message object, not a bare ID string
+            try {
+                const quotedMsg = await client.getMessageById(req.body.quotedMessageId);
+                if (quotedMsg) options.quotedMessageId = quotedMsg;
+            } catch (qErr) {
+                console.warn('Could not resolve quoted message:', qErr.message);
+            }
+        }
+        response = await client.sendMessage(chatId, message, options);
     }
+
+    res.json({ success: true, response });
+} catch (error) {
+    console.error("Send Error:", error);
+    res.status(500).json({ success: false, error: error.message });
+}
 });
 
 

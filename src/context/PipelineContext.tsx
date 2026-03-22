@@ -7,6 +7,7 @@ interface PipelineStage {
     name: string;
     position: number;
     color: string;
+    subStages?: { id: string; name: string }[];
 }
 
 interface PipelineContextType {

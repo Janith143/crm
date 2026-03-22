@@ -393,7 +393,7 @@ const AppContent: React.FC = () => {
           <Routes>
             <Route path="/" element={<DashboardHome teachers={teachers} onNavigate={handleDashboardNavigate} />} />
             <Route path="/inbox" element={<InboxPage teachers={teachers} onUpdateTeacher={handleUpdateTeacher} selectedTeacherId={selectedTeacherId} />} />
-            <Route path="/pipeline" element={<PipelinePage teachers={teachers} updateStatus={updateTeacherStatus} />} />
+            <Route path="/pipeline" element={<PipelinePage teachers={teachers} updateStatus={updateTeacherStatus} onUpdateTeacher={handleUpdateTeacher} />} />
             <Route path="/contacts" element={<ContactsPage teachers={teachers} setTeachers={handleUpdateTeacher} />} />
             <Route path="/broadcast" element={<BroadcastPage teachers={teachers} />} />
             <Route path="/automations" element={<AutomationPage />} />

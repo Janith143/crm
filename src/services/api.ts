@@ -93,6 +93,15 @@ export const createPipelineStage = async (stage: any) => {
     return response.json();
 };
 
+export const updatePipelineStage = async (id: string, updates: any) => {
+    const response = await fetch(`${API_BASE}/pipeline-stages/${id}`, {
+        method: 'PUT',
+        headers: getAuthHeaders(),
+        body: JSON.stringify(updates)
+    });
+    return response.json();
+};
+
 export const deletePipelineStage = async (id: string) => {
     const response = await fetch(`${API_BASE}/pipeline-stages/${id}`, {
         method: 'DELETE',
