@@ -720,9 +720,85 @@ app.get('/api/webhook', async (req, res) => {
 app.post('/api/webhook', async (req, res) => {
     const body = req.body;
     if (body.object === 'whatsapp_business_account') {
-        // Handle webhook events (simplified)
-        res.sendStatus(200);
-    } else res.sendStatus(404);
+        res.sendStatus(200); // 1. Always acknowledge receipt to Meta immediately!
+
+        try {
+            if (body.entry && body.entry[0] && body.entry[0].changes && body.entry[0].changes[0]) {
+                const value = body.entry[0].changes[0].value;
+
+                // --- 2. Handle Status Updates (Delivery & Read Receipts) ---
+                if (value.statuses && value.statuses.length > 0) {
+                    for (const statusObj of value.statuses) {
+                        const msgId = statusObj.id;
+                        const status = statusObj.status; // sent, delivered, read, failed
+                        let ack = 0;
+                        if (status === 'sent') ack = 1;
+                        if (status === 'delivered') ack = 2;
+                        if (status === 'read') ack = 3;
+
+                        await pool.query('UPDATE messages SET ack = ?, status = ? WHERE id = ?', [ack, status, msgId]);
+                        io.emit('message_update', { id: msgId, status, ack });
+                    }
+                }
+
+                // --- 3. Handle Incoming Messages ---
+                if (value.messages && value.messages.length > 0) {
+                    for (const msg of value.messages) {
+                        const phone = msg.from;
+                        const chatId = `${phone}@c.us`;
+                        const id = msg.id;
+                        const timestamp = parseInt(msg.timestamp);
+                        const type = msg.type;
+                        let bodyText = '';
+                        let hasMedia = false;
+
+                        if (type === 'text') {
+                            bodyText = msg.text?.body || '';
+                        } else if (['image', 'video', 'document', 'audio'].includes(type)) {
+                            hasMedia = true;
+                            bodyText = msg[type]?.caption || `[${type} received]`;
+                        } else {
+                            bodyText = `[${type} received]`;
+                        }
+
+                        let chatName = phone;
+                        if (value.contacts && value.contacts.length > 0) {
+                            const contactName = value.contacts.find(c => c.wa_id === phone)?.profile?.name;
+                            if (contactName) chatName = contactName;
+                        }
+
+                        // Save the message locally
+                        await pool.query(
+                            `INSERT INTO messages (id, chat_id, sender_id, from_me, body, timestamp, status, type, has_media, ack) 
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                             ON DUPLICATE KEY UPDATE body = VALUES(body), status = VALUES(status), type = VALUES(type), has_media = VALUES(has_media)`,
+                            [id, chatId, phone, 0, bodyText, timestamp, 'received', type, hasMedia ? 1 : 0, 0]
+                        );
+
+                        // Update or Create Chat entry for the inbox
+                        await pool.query(
+                            `INSERT INTO chats (id, name, unread_count, timestamp, last_message, last_message_type, last_message_status, last_message_from_me)
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                             ON DUPLICATE KEY UPDATE name = IF(name=id, VALUES(name), name), timestamp = VALUES(timestamp), last_message = VALUES(last_message), last_message_type = VALUES(last_message_type), last_message_status = VALUES(last_message_status), last_message_from_me = VALUES(last_message_from_me), unread_count = unread_count + 1`,
+                            [chatId, chatName, 1, timestamp, bodyText || (hasMedia ? '📷 Media' : ''), type, 0, 0]
+                        );
+
+                        // Signal frontend to update Inbox real-time!
+                        io.emit('message_new', {
+                            id, chatId, senderId: 'teacher', text: bodyText,
+                            timestamp: new Date(timestamp * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+                            isIncoming: true, status: 'received',
+                            type, hasMedia, mediaType: type
+                        });
+                    }
+                }
+            }
+        } catch (e) {
+            console.error("Webhook processing error:", e);
+        }
+    } else {
+        res.sendStatus(404);
+    }
 });
 
 // --- Sync & Init ---
