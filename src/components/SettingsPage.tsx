@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Save, AlertCircle, CheckCircle, Smartphone, QrCode, RefreshCw, LogOut, LayoutGrid, Key, Shield } from 'lucide-react';
 import { type WhatsAppSettings } from '../types';
-import { getStoredSettings, saveSettings, getBackendStatus, logoutBackend, saveSettingsToBackend } from '../services/whatsappService';
+import { getStoredSettings, saveSettings, getBackendStatus, logoutBackend, saveSettingsToBackend, getSettingsFromBackend } from '../services/whatsappService';
 import { socket } from '../services/socket';
 
 const SettingsPage = () => {
@@ -69,13 +69,30 @@ const SettingsPage = () => {
   }, [qrStatus, settings.isLinked, settings.linkedNumber, settings.sessionName]);
 
   useEffect(() => {
-    const stored = getStoredSettings();
-    if (stored) {
-      setSettings(stored);
-      if (stored.connectionType) {
-        setActiveTab(stored.connectionType);
+    const loadSettings = async () => {
+      // 1. Try backend first
+      const backendSettings = await getSettingsFromBackend();
+      if (backendSettings) {
+        setSettings(prev => ({ ...prev, ...backendSettings as WhatsAppSettings }));
+        if (backendSettings.connectionType) {
+          setActiveTab(backendSettings.connectionType as 'qr' | 'official');
+        }
+        // Sync to local storage to keep it updated
+        const newSettings = { ...getStoredSettings(), ...backendSettings };
+        localStorage.setItem('whatsapp_settings', JSON.stringify(newSettings));
+      } else {
+        // 2. Fallback to local storage if backend fetch fails
+        const stored = getStoredSettings();
+        if (stored) {
+          setSettings(stored);
+          if (stored.connectionType) {
+            setActiveTab(stored.connectionType);
+          }
+        }
       }
-    }
+    };
+
+    loadSettings();
 
     // Check status on load
     checkBackendStatus();

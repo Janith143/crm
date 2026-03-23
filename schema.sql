@@ -80,3 +80,14 @@ CREATE TABLE IF NOT EXISTS app_settings (
     setting_value TEXT,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS activities (
+    id VARCHAR(255) PRIMARY KEY,
+    teacher_id VARCHAR(255) NOT NULL,
+    type VARCHAR(50) NOT NULL,
+    title VARCHAR(255) NOT NULL,
+    description TEXT,
+    timestamp VARCHAR(255),
+    user VARCHAR(255) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_teacher_id (teacher_id)
+);

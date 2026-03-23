@@ -45,6 +45,33 @@ export const saveSettingsToBackend = async (settingsPayload: any) => {
   }
 };
 
+export const getSettingsFromBackend = async (): Promise<Partial<WhatsAppSettings> | null> => {
+  try {
+    const token = localStorage.getItem('token');
+    const response = await fetch(`${API_BASE}/settings`, {
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token && { Authorization: `Bearer ${token}` })
+      }
+    });
+    const data = await response.json();
+    if (data.success && data.settings) {
+      return {
+        connectionType: data.settings.WA_PROVIDER as 'qr' | 'official' || 'qr',
+        accessToken: data.settings.WA_CLOUD_TOKEN || '',
+        phoneNumberId: data.settings.WA_PHONE_ID || '',
+        businessAccountId: data.settings.WA_BUSINESS_ACCOUNT_ID || '',
+        verifyToken: data.settings.WA_VERIFY_TOKEN || '',
+        appId: data.settings.WA_APP_ID || '',
+        appSecret: data.settings.WA_APP_SECRET || ''
+      };
+    }
+  } catch (error) {
+    console.error("Failed to fetch settings from backend", error);
+  }
+  return null;
+};
+
 // Helper to include JWT auth header when user is logged in
 const getAuthHeaders = () => {
   const token = localStorage.getItem('token');
