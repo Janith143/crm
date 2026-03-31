@@ -17,6 +17,16 @@ import multer from 'multer';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// Helper for safe JSON parsing
+const safeJSONParse = (str, fallback = []) => {
+    try {
+        if (!str || typeof str !== 'string' || str.trim() === '') return fallback;
+        return JSON.parse(str);
+    } catch (e) {
+        return fallback;
+    }
+};
+
 const { Client, LocalAuth, MessageMedia } = whatsappWeb;
 
 const app = express();
@@ -353,7 +363,7 @@ async function handleIncomingOrCreatedMessage(msg, eventSource = 'message_create
             const session = sessionRows[0];
             const [rules] = await pool.query('SELECT * FROM automation_rules WHERE id = ?', [session.workflow_id]);
             if (rules.length > 0) {
-                const steps = JSON.parse(rules[0].steps || '[]');
+                const steps = safeJSONParse(rules[0].steps, []);
                 const currentStep = steps.find(s => s.id === session.current_step_index.toString());
                 if (currentStep) {
                     const matchedOption = currentStep.options?.find(opt => body.includes(opt.keyword.toLowerCase()));
@@ -382,7 +392,7 @@ async function handleIncomingOrCreatedMessage(msg, eventSource = 'message_create
         for (const rule of activeRules) {
             const match = rule.match_type === 'exact' ? body === rule.trigger_text.toLowerCase() : body.includes(rule.trigger_text.toLowerCase());
             if (match) {
-                const steps = JSON.parse(rule.steps || '[]');
+                const steps = safeJSONParse(rule.steps, []);
                 let content = rule.response_text;
                 let stepId = '0';
                 if (steps.length > 0) { content = steps[0].content; stepId = steps[0].id; }
@@ -411,7 +421,7 @@ app.get('/api/automations', async (req, res) => {
             success: true, rules: rows.map(r => ({
                 id: r.id, name: r.name, trigger: r.trigger_text, response: r.response_text,
                 active: !!r.active, matchType: r.match_type, hitCount: r.hit_count,
-                steps: JSON.parse(r.steps || '[]')
+                steps: safeJSONParse(r.steps, [])
             }))
         });
     } catch (e) { res.status(500).json({ error: e.message }); }
@@ -473,7 +483,7 @@ app.get('/api/metadata', async (req, res) => {
     try {
         const [rows] = await pool.query('SELECT * FROM teacher_metadata');
         const metadata = {};
-        rows.forEach(r => { metadata[r.id] = { name: r.name, source: r.source, status: r.status, subStatus: r.sub_status, tags: JSON.parse(r.tags || '[]'), notes: r.notes, location: r.location, email: r.email }; });
+        rows.forEach(r => { metadata[r.id] = { name: r.name, source: r.source, status: r.status, subStatus: r.sub_status, tags: safeJSONParse(r.tags, []), notes: r.notes, location: r.location, email: r.email }; });
         res.json({ success: true, metadata });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -491,7 +501,7 @@ app.post('/api/metadata/:id', async (req, res) => {
 app.get('/api/pipeline-stages', async (req, res) => {
     try {
         const [rows] = await pool.query('SELECT * FROM pipeline_stages ORDER BY position ASC');
-        res.json({ success: true, stages: rows.map(r => ({ id: r.id, name: r.name, position: r.position, color: r.color, subStages: JSON.parse(r.sub_stages || '[]') })) });
+        res.json({ success: true, stages: rows.map(r => ({ id: r.id, name: r.name, position: r.position, color: r.color, subStages: safeJSONParse(r.sub_stages, []) })) });
     } catch (e) { res.status(500).json({ success: true, stages: MOCK_PIPELINE_STAGES }); }
 });
 
@@ -563,8 +573,10 @@ app.delete('/api/clear-cache', async (req, res) => {
 // --- Chats & Messages ---
 const mapRowsToChats = (rows) => rows.map(r => ({
     id: r.id, name: r.metadata_name || r.name, phone: r.id, unreadCount: r.unread_count, timestamp: r.timestamp,
-    lastMessage: { body: r.last_message, type: r.last_message_type, status: r.last_message_status, fromMe: !!r.last_message_from_me },
-    source: r.source || 'whatsapp', status: r.status || 'New Lead', tags: JSON.parse(r.tags || '[]'), notes: r.notes || '', location: r.location || '', email: r.email || ''
+    lastMessage: { body: r.last_message, type: r.last_message_type, status: r.last_message_status, from_me: !!r.last_message_from_me },
+    source: r.source || 'whatsapp', status: r.status || 'New Lead',
+    tags: safeJSONParse(r.tags, []),
+    notes: r.notes || '', location: r.location || '', email: r.email || ''
 }));
 
 app.get('/api/chats', async (req, res) => {
