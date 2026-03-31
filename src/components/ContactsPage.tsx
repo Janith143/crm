@@ -82,6 +82,46 @@ const ContactsPage: React.FC<ContactsPageProps> = ({ teachers, setTeachers: upda
     setOpenActionMenuId(null);
   };
 
+  const handleDownloadContacts = () => {
+    const csvRows = [];
+    const headers = ['Pipeline Stage', 'Name', 'Phone', 'Location', 'Source', 'Tags', 'Notes', 'Unread Count', 'Last Active'];
+    csvRows.push(headers.join(','));
+
+    // Get all unique stages (pipeline stages + any other statuses)
+    const allStages = [
+      ...stages.map(s => s.name),
+      ...Array.from(new Set(teachers.map(t => t.status).filter(s => !stages.some(st => st.name === s))))
+    ];
+
+    allStages.forEach(stageName => {
+      const stageTeachers = teachers.filter(t => t.status === stageName);
+      stageTeachers.forEach(t => {
+        const row = [
+          `"${t.status || ''}"`,
+          `"${(t.name || '').replace(/"/g, '""')}"`,
+          `"${(t.phone || '').replace(/"/g, '""')}"`,
+          `"${(t.location || '').replace(/"/g, '""')}"`,
+          `"${(t.source || '').replace(/"/g, '""')}"`,
+          `"${(t.tags || []).join(', ').replace(/"/g, '""')}"`,
+          `"${(t.notes || '').replace(/"/g, '""')}"`,
+          t.unreadCount || 0,
+          `"${(t.lastActive || '').replace(/"/g, '""')}"`
+        ];
+        csvRows.push(row.join(','));
+      });
+    });
+
+    const csvContent = csvRows.join('\n');
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.setAttribute('download', `contacts_${new Date().toISOString().split('T')[0]}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
   // Modal Handlers
   const openAddModal = () => {
     setIsEditing(false);
@@ -195,7 +235,7 @@ const ContactsPage: React.FC<ContactsPageProps> = ({ teachers, setTeachers: upda
             <button className="p-2 text-slate-600 hover:bg-slate-100 rounded-lg border border-slate-200">
               <Filter size={18} />
             </button>
-            <button className="p-2 text-slate-600 hover:bg-slate-100 rounded-lg border border-slate-200">
+            <button onClick={handleDownloadContacts} className="p-2 text-slate-600 hover:bg-slate-100 rounded-lg border border-slate-200" title="Download Contacts">
               <Download size={18} />
             </button>
           </div>
