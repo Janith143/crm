@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import whatsappWeb from 'whatsapp-web.js';
 import qrcode from 'qrcode';
+import qrcodeTerminal from 'qrcode-terminal';
 import cors from 'cors';
 import pool from './db.js';
 import { MOCK_AUTOMATION_RULES, MOCK_TEACHER_METADATA, MOCK_PIPELINE_STAGES } from './mockData.js';
@@ -190,6 +191,7 @@ let isAuthenticated = false;
 // Events
 client.on('qr', (qr) => {
     console.log('QR RECEIVED');
+    qrcodeTerminal.generate(qr, { small: true });
     qrcode.toDataURL(qr, (err, url) => {
         qrCodeData = url;
         io.emit('qr', { qr: url });

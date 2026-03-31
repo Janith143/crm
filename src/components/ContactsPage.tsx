@@ -97,15 +97,15 @@ const ContactsPage: React.FC<ContactsPageProps> = ({ teachers, setTeachers: upda
       const stageTeachers = teachers.filter(t => t.status === stageName);
       stageTeachers.forEach(t => {
         const row = [
-          `"${t.status || ''}"`,
-          `"${(t.name || '').replace(/"/g, '""')}"`,
-          `"${(t.phone || '').replace(/"/g, '""')}"`,
-          `"${(t.location || '').replace(/"/g, '""')}"`,
-          `"${(t.source || '').replace(/"/g, '""')}"`,
+          `"${String(t.status || '')}"`,
+          `"${String(t.name || '').replace(/"/g, '""')}"`,
+          `"${String(t.phone || '').replace(/"/g, '""')}"`,
+          `"${String(t.location || '').replace(/"/g, '""')}"`,
+          `"${String(t.source || '').replace(/"/g, '""')}"`,
           `"${(t.tags || []).join(', ').replace(/"/g, '""')}"`,
-          `"${(t.notes || '').replace(/"/g, '""')}"`,
+          `"${String(t.notes || '').replace(/"/g, '""')}"`,
           t.unreadCount || 0,
-          `"${(t.lastActive || '').replace(/"/g, '""')}"`
+          `"${String(t.lastActive || '').replace(/"/g, '""')}"`
         ];
         csvRows.push(row.join(','));
       });
